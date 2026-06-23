@@ -199,7 +199,7 @@ impl State {
                     0 => { self.host_port = self.edit_buf.parse().unwrap_or(self.host_port); }
                     1 => {
                         let v: usize = self.edit_buf.parse().unwrap_or(self.host_bots);
-                        if v <= 7 { self.host_bots = v; } else { self.error = Some(Instant::now()); }
+                        if v <= 19 { self.host_bots = v; } else { self.error = Some(Instant::now()); }
                     }
                     2 => {
                         let v: i32 = self.edit_buf.parse().unwrap_or(self.host_lives);

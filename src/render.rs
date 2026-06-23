@@ -22,8 +22,8 @@ const BALL: Rgb = (245, 246, 250);
 const COUNT_C: Rgb = (250, 214, 120);
 const LOCAL_HI: Rgb = (250, 252, 255);
 
-/// Colori distinti per i giocatori (fino a 8).
-const PLAYER_COLORS: [Rgb; 8] = [
+/// Colori distinti per i giocatori (fino a 20).
+const PLAYER_COLORS: [Rgb; 20] = [
     (90, 224, 205),  // teal
     (236, 120, 196), // rosa
     (250, 196, 100), // ambra
@@ -32,6 +32,18 @@ const PLAYER_COLORS: [Rgb; 8] = [
     (245, 130, 120), // corallo
     (196, 150, 255), // viola
     (240, 232, 130), // giallo
+    (255, 155, 190), // malva
+    (140, 255, 210), // menta
+    (255, 180, 100), // pesca
+    (170, 215, 255), // cielo
+    (210, 135, 255), // orchidea
+    (255, 220, 140), // miele
+    (120, 190, 120), // salvia
+    (255, 105, 180), // magenta
+    (110, 170, 255), // azzurro chiaro
+    (220, 140, 115), // terracotta
+    (180, 115, 255), // lilla
+    (255, 230, 120), // crema
 ];
 
 fn player_color(pid: usize) -> Rgb {
