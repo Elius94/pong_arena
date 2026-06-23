@@ -14,6 +14,7 @@ mod app;
 mod arena;
 mod game;
 mod geom;
+mod menu;
 mod net;
 mod render;
 mod terminal;
@@ -64,20 +65,6 @@ fn prompt_nickname() -> String {
     }
 }
 
-/// Legge una riga da stdin, trimma, e se vuota ritorna il default.
-fn prompt_line(prompt: &str, default: &str) -> String {
-    eprint!("{prompt} [{default}]: ");
-    let _ = io::stdout().flush();
-    let mut buf = String::new();
-    io::stdin().read_line(&mut buf).unwrap_or(0);
-    let s = buf.trim().to_string();
-    if s.is_empty() {
-        default.to_string()
-    } else {
-        s
-    }
-}
-
 /// Parse opzioni comuni (--port, --nickname) per il caso join.
 fn parse_join_opts(args: &[String], i: &mut usize) -> (u16, String) {
     let mut port = DEFAULT_PORT;
@@ -107,140 +94,33 @@ fn parse_join_opts(args: &[String], i: &mut usize) -> (u16, String) {
 }
 
 // ---------------------------------------------------------------------------
-// Menu interattivo
-// ---------------------------------------------------------------------------
-
-fn read_input() -> Option<String> {
-    let mut buf = String::new();
-    io::stdin().read_line(&mut buf).ok()?;
-    let s = buf.trim().to_string();
-    if s.is_empty() { None } else { Some(s) }
-}
-
-fn interactive_menu() {
-    let mut nickname = String::new();
-    let mut port = DEFAULT_PORT;
-    let mut lives = DEFAULT_LIVES;
-
-    loop {
-        // Pulisci schermo (ANSI) per un menu pulito.
-        eprint!("\x1b[2J\x1b[H");
-        let _ = io::stderr().flush();
-
-        let nick_display = if nickname.is_empty() {
-            "(nessuno)".to_string()
-        } else {
-            nickname.clone()
-        };
-
-        eprintln!("╔════════════════════════════════╗");
-        eprintln!("║        ▌ PONG · ARENA ▐        ║");
-        eprintln!("╠════════════════════════════════╣");
-        eprintln!("║                                ║");
-        eprintln!("║  1  Host (multiplayer)         ║");
-        eprintln!("║  2  Join (multiplayer)         ║");
-        eprintln!("║                                ║");
-        eprintln!("╠════════════════════════════════╣");
-        eprintln!("║  3  Imposta nickname           ║");
-        eprintln!("║  4  Imposta porta              ║");
-        eprintln!("║  5  Imposta vite               ║");
-        eprintln!("║                                ║");
-        eprintln!("╠════════════════════════════════╣");
-        eprintln!("║  Q  Esci                       ║");
-        eprintln!("║                                ║");
-        eprintln!("╚════════════════════════════════╝");
-        eprintln!();
-        eprintln!("  nickname: {nick_display}  porta: {port}  vite: {lives}");
-        eprintln!();
-        eprint!("Scegli: ");
-        let _ = io::stderr().flush();
-
-        let choice = match read_input() {
-            Some(c) => c,
-            None => continue,
-        };
-
-        match choice.as_str() {
-            "1" | "h" | "H" => {
-                // --- HOST ---
-                let bots_s = prompt_line("Numero bot", "0");
-                let bots: usize = bots_s.parse().unwrap_or(0).min(7);
-                let name = if nickname.is_empty() {
-                    prompt_nickname()
-                } else {
-                    nickname.clone()
-                };
-                eprintln!("Avvio host su porta {port} con {bots} bot, {lives} vite...");
-                if let Err(e) = app::run_host(port, bots, name, lives) {
-                    eprintln!("Errore host: {e}");
-                    eprintln!("Premi INVIO per continuare...");
-                    let _ = io::stdin().read_line(&mut String::new());
-                }
-            }
-            "2" | "j" | "J" => {
-                // --- JOIN ---
-                let addr = prompt_line("Indirizzo IP", "127.0.0.1");
-                let name = if nickname.is_empty() {
-                    prompt_nickname()
-                } else {
-                    nickname.clone()
-                };
-                eprintln!("Connessione a {addr}:{port}...");
-                if let Err(e) = app::run_guest(&addr, port, name) {
-                    eprintln!("Errore guest: {e}");
-                    eprintln!("Premi INVIO per continuare...");
-                    let _ = io::stdin().read_line(&mut String::new());
-                }
-            }
-            "3" | "n" | "N" => {
-                // --- NICKNAME ---
-                let new_nick = prompt_line("Nickname", &nickname);
-                nickname = new_nick;
-            }
-            "4" | "p" | "P" => {
-                // --- PORTA ---
-                let port_s = prompt_line("Porta TCP", &port.to_string());
-                if let Ok(p) = port_s.parse::<u16>() {
-                    port = p;
-                } else {
-                    eprintln!("Porta non valida.");
-                    eprintln!("Premi INVIO per continuare...");
-                    let _ = io::stdin().read_line(&mut String::new());
-                }
-            }
-            "5" | "v" | "V" => {
-                // --- VITE ---
-                let lives_s = prompt_line("Vite per giocatore", &lives.to_string());
-                if let Ok(l) = lives_s.parse::<i32>() {
-                    if l >= 1 && l <= 99 {
-                        lives = l;
-                    } else {
-                        eprintln!("Valore fuori range (1-99).");
-                        eprintln!("Premi INVIO per continuare...");
-                        let _ = io::stdin().read_line(&mut String::new());
-                    }
-                } else {
-                    eprintln!("Valore non valido.");
-                    eprintln!("Premi INVIO per continuare...");
-                    let _ = io::stdin().read_line(&mut String::new());
-                }
-            }
-            "q" | "Q" | "x" | "X" => break,
-            _ => {}
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
-    // Se zero argomenti → menu interattivo.
+    // Se zero argomenti → menu interattivo TUI.
     if args.is_empty() {
-        interactive_menu();
+        match menu::run_menu() {
+            Some((menu::MenuResult::Host, cfg)) => {
+                if let Err(e) = app::run_host(cfg.port, cfg.bots, cfg.nickname, cfg.lives) {
+                    eprintln!("Errore host: {e}");
+                    std::process::exit(1);
+                }
+            }
+            Some((menu::MenuResult::Join, cfg)) => {
+                if cfg.addr.is_empty() {
+                    eprintln!("Indirizzo IP non fornito.");
+                    std::process::exit(1);
+                }
+                if let Err(e) = app::run_guest(&cfg.addr, cfg.port, cfg.nickname) {
+                    eprintln!("Errore guest: {e}");
+                    std::process::exit(1);
+                }
+            }
+            _ => {}
+        }
         return;
     }
 
