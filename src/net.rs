@@ -33,6 +33,8 @@ pub fn spawn_input_reader(reader: BufReader<TcpStream>) -> InputChannel {
         intent: 0,
         restart: false,
         quit: false,
+        fire: false,
+        grenade: false,
     }));
     let disconnected = Arc::new(AtomicBool::new(false));
     let last_c = last.clone();
@@ -48,13 +50,15 @@ pub fn spawn_input_reader(reader: BufReader<TcpStream>) -> InputChannel {
                 Ok(_) => {
                     if let Some(inp) = NetInput::decode(line.trim_end()) {
                         let mut g = last_c.lock().unwrap();
-                        // 'restart'/'quit' sono edge: li accumuliamo finché il
-                        // game loop non li consuma azzerando il canale.
+                        // I flag edge si accumulano finché il game loop non
+                        // li consuma tramite take_edges().
                         let prev = *g;
                         *g = NetInput {
                             intent: inp.intent,
                             restart: prev.restart || inp.restart,
                             quit: prev.quit || inp.quit,
+                            fire: prev.fire || inp.fire,
+                            grenade: prev.grenade || inp.grenade,
                         };
                         if inp.quit {
                             break;
@@ -71,14 +75,18 @@ pub fn spawn_input_reader(reader: BufReader<TcpStream>) -> InputChannel {
 }
 
 impl InputChannel {
-    /// Consuma i flag edge (restart/quit) dopo averli letti.
-    pub fn take_edges(&self) -> (bool, bool) {
+    /// Consuma i flag edge (restart, quit, fire, grenade) dopo averli letti.
+    pub fn take_edges(&self) -> (bool, bool, bool, bool) {
         let mut g = self.last.lock().unwrap();
         let r = g.restart;
         let q = g.quit;
+        let f = g.fire;
+        let gr = g.grenade;
         g.restart = false;
+        g.fire = false;
+        g.grenade = false;
         // 'quit' resta vero: la disconnessione è definitiva.
-        (r, q)
+        (r, q, f, gr)
     }
 }
 

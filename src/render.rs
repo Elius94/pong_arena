@@ -7,6 +7,9 @@
 use crate::arena::*;
 use crate::game::*;
 use crate::geom::*;
+
+const SLOW_TINT: Rgb = (255, 160, 50);   // arancio per il rallentamento
+const FREEZE_TINT: Rgb = (80, 190, 255); // azzurro ghiaccio per il blocco
 use std::collections::VecDeque;
 use std::io::{self, Write};
 
@@ -202,9 +205,22 @@ pub fn draw_arena(f: &mut Frame, snap: &Snapshot, my_id: usize, trail: &VecDeque
                     // lato eliminato → muro solido
                     f.line(pa, pb, 1.4, WALL_SOLID);
                 } else {
-                    // lato difeso: linea tenue + racchetta colorata
+                    // lato difeso: linea tenue + racchetta colorata con eventuale tinta arma
                     f.line(pa, pb, 0.8, WALL_DIM);
-                    let col = player_color(pid);
+                    let base_col = player_color(pid);
+                    let col = if pid < snap.weapons.len() {
+                        let (_, slow_t, freeze_t, _) = snap.weapons[pid];
+                        if freeze_t > 0.0 {
+                            mix(base_col, FREEZE_TINT, 0.75)
+                        } else if slow_t > 0.0 {
+                            // L'intensità della tinta arancio cresce col livello di slow
+                            mix(base_col, SLOW_TINT, 0.3 + 0.55 * slow_t)
+                        } else {
+                            base_col
+                        }
+                    } else {
+                        base_col
+                    };
                     let (e0, e1) = arena.paddle_endpoints(pid, c, PADDLE_FRAC);
                     let (q0, q1) = (view.px(e0), view.px(e1));
                     let thick = if pid == my_id { 2.6 } else { 2.0 };
@@ -224,6 +240,13 @@ pub fn draw_arena(f: &mut Frame, snap: &Snapshot, my_id: usize, trail: &VecDeque
                 f.number(val, lx.round() as i32, ly.round() as i32 - 2 * s, s, col);
             }
         }
+    }
+
+    // Proiettili.
+    for &(pos, shooter) in &snap.bullets {
+        let (px, py) = view.px(pos);
+        let r = (BULLET_R * view.scale).max(2.0);
+        f.disc(px, py, r, player_color(shooter));
     }
 
     // Scia + palla (nascoste a fine partita).
@@ -322,16 +345,26 @@ pub fn chrome(
         title_right,
     );
 
-    let help = "[←/→ · A/D · W/S] muovi   [R] rivincita   [Q] esci";
+    let help = "[←/→] muovi   [SPACE] spara   [G] granata   [R] rivincita   [Q] esci";
     text_at(&mut out, rows.saturating_sub(1), 1, dim, help);
 
     if let Some(sc) = snap {
         if my_id < sc.players.len() {
             let (_, lives, alive) = sc.players[my_id];
             let mine = if alive {
-                format!("tu: {} vite", lives.max(0))
+                let (ammo, _, _, grenades) =
+                    sc.weapons.get(my_id).copied().unwrap_or((AMMO_MAX, 0.0, 0.0, 0));
+                let bar: String = (0..AMMO_MAX as usize)
+                    .map(|i| if i < ammo as usize { '█' } else { '░' })
+                    .collect();
+                let grenade_part = if grenades > 0 {
+                    format!("  ◆x{}", grenades)
+                } else {
+                    String::new()
+                };
+                format!("{} vite  {}{}", lives.max(0), bar, grenade_part)
             } else {
-                "tu: eliminato".to_string()
+                "eliminato".to_string()
             };
             let col = player_color(my_id);
             text_at(

@@ -290,11 +290,14 @@ pub fn run_host(port: u16, bots: usize) -> std::io::Result<()> {
         }
 
         // Restart (solo a fine partita) da host o da un qualsiasi guest.
+        // Raccoglie anche le azioni armi dei guest (edge-triggered).
         let mut want_restart = input.restart;
+        let mut guest_actions: Vec<(bool, bool)> = vec![(false, false); n];
         for pid in 1..n {
             if let Some(ch) = &inputs[pid] {
-                let (r, _q) = ch.take_edges();
+                let (r, _q, fire, grenade) = ch.take_edges();
                 want_restart |= r;
+                guest_actions[pid] = (fire, grenade);
             }
         }
         if matches!(game.phase, Phase::GameOver(_)) && want_restart {
@@ -303,13 +306,18 @@ pub fn run_host(port: u16, bots: usize) -> std::io::Result<()> {
         }
         input.restart = false;
 
-        // Movimento: host (pid 0), guest (input di rete), bot (IA).
+        // Movimento e armi: host (pid 0), guest (input di rete), bot (IA).
         game.apply_input(0, input.intent, dt);
+        game.apply_action(0, input.fire, input.grenade);
+        input.fire = false;
+        input.grenade = false;
         for pid in 1..n {
             if is_bot[pid] {
                 game.bot_step(pid, dt);
             } else if let Some(ch) = &inputs[pid] {
                 game.apply_input(pid, ch.get().intent, dt);
+                let (fire, grenade) = guest_actions[pid];
+                game.apply_action(pid, fire, grenade);
             }
         }
 
@@ -394,10 +402,14 @@ pub fn run_guest(addr: &str, port: u16) -> std::io::Result<()> {
             intent: input.intent,
             restart: input.restart,
             quit: input.quit,
+            fire: input.fire,
+            grenade: input.grenade,
         };
         let _ = writer.write_all(ni.encode().as_bytes());
         let _ = writer.flush();
         input.restart = false;
+        input.fire = false;
+        input.grenade = false;
 
         if input.quit {
             break;
@@ -449,6 +461,8 @@ pub fn run_guest(addr: &str, port: u16) -> std::io::Result<()> {
             intent: 0,
             restart: false,
             quit: true,
+            fire: false,
+            grenade: false,
         }
         .encode()
         .as_bytes(),

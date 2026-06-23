@@ -65,6 +65,8 @@ pub struct InputState {
     pub intent: i32,
     pub quit: bool,
     pub restart: bool, // edge: vero per un frame, va consumato dal chiamante
+    pub fire: bool,    // edge: spara col fucile (Space)
+    pub grenade: bool, // edge: usa granata (G)
     last_at: Instant,
     saw_release: bool,
 }
@@ -79,6 +81,8 @@ impl InputState {
             intent: 0,
             quit: false,
             restart: false,
+            fire: false,
+            grenade: false,
             last_at: Instant::now(),
             saw_release: false,
         }
@@ -137,6 +141,8 @@ impl InputState {
                         self.quit = true
                     }
                     KeyCode::Char('r') | KeyCode::Char('R') => self.restart = true,
+                    KeyCode::Char(' ') => self.fire = true,
+                    KeyCode::Char('g') | KeyCode::Char('G') => self.grenade = true,
                     _ => {}
                 }
             }
