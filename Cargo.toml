@@ -1,0 +1,10 @@
+[package]
+name = "pong_arena"
+version = "0.2.0"
+edition = "2021"
+
+[dependencies]
+crossterm = "0.28"
+
+[profile.release]
+opt-level = 2
