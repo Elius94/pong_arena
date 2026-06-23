@@ -185,6 +185,10 @@ pub fn run_host(port: u16, bots: usize) -> std::io::Result<()> {
             match listener.accept() {
                 Ok((s, _addr)) => {
                     let _ = s.set_nodelay(true);
+                    // On Windows, accepted sockets inherit the listener's
+                    // non-blocking mode. Explicitly reset to blocking so that
+                    // the reader threads do not get WouldBlock immediately.
+                    let _ = s.set_nonblocking(false);
                     if 1 + clients.len() + bots < MAX_PLAYERS {
                         clients.push(s);
                     }
