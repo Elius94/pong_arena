@@ -331,6 +331,7 @@ pub fn chrome(
     snap: Option<&Snapshot>,
     my_id: usize,
     status: Option<&str>,
+    names: &[String],
 ) -> String {
     let mut out = String::new();
     let dim = (120, 130, 150);
@@ -344,6 +345,26 @@ pub fn chrome(
         dim,
         title_right,
     );
+
+    // Riga giocatori: nomi colorati uno accanto all'altro.
+    if let Some(sc) = snap {
+        let mut px = 1;
+        for (i, (_c, _lives, alive)) in sc.players.iter().enumerate() {
+            let name = names.get(i).map(|s| s.as_str()).unwrap_or("???");
+            let marker = if i == my_id { "▸" } else { " " };
+            let label = if *alive {
+                format!("{}{}♥{}", marker, name, _lives)
+            } else {
+                format!("{}{}✗", marker, name)
+            };
+            let col = if *alive { player_color(i) } else { dim };
+            text_at(&mut out, 1, px, col, &label);
+            px += label.chars().count() + 2;
+            if px >= cols {
+                break;
+            }
+        }
+    }
 
     let help = "[←/→] muovi   [SPACE] spara   [G] granata   [R] rivincita   [Q] esci";
     text_at(&mut out, rows.saturating_sub(1), 1, dim, help);
@@ -383,13 +404,14 @@ pub fn chrome(
 }
 
 /// Overlay di fine partita.
-pub fn game_over_overlay(cols: usize, rows: usize, winner: usize, my_id: usize) -> String {
+pub fn game_over_overlay(cols: usize, rows: usize, winner: usize, my_id: usize, names: &[String]) -> String {
     let mut out = String::new();
+    let winner_name = names.get(winner).map(|s| s.as_str()).unwrap_or("???");
     let (msg, color) = if winner == my_id {
         ("★  HAI VINTO  ★".to_string(), (120, 240, 160))
     } else {
         (
-            format!("VINCE IL GIOCATORE {}", winner + 1),
+            format!("VINCE {}", winner_name),
             player_color(winner),
         )
     };

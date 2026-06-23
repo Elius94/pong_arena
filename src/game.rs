@@ -40,12 +40,13 @@ pub enum Phase {
     GameOver(usize), // id del vincitore
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Player {
     pub c: f32,       // centro racchetta in parametro-di-lato [0,1]
     pub lives: i32,   // vite residue
     pub alive: bool,  // ancora in gioco
     pub connected: bool,
+    pub name: String, // nickname del giocatore
 }
 
 /// Stato delle armi di un singolo giocatore.
@@ -117,11 +118,12 @@ impl GameState {
         let arena = Arena::new(n_players);
         let n = arena.players;
         let players = (0..n)
-            .map(|_| Player {
+            .map(|_i| Player {
                 c: 0.5,
                 lives: LIVES_START,
                 alive: true,
                 connected: true,
+                name: String::new(),
             })
             .collect();
         let param_sign = Self::compute_param_sign(n);
@@ -140,6 +142,15 @@ impl GameState {
         };
         g.serve();
         g
+    }
+
+    /// Assegna i nickname ai giocatori.
+    pub fn set_names(&mut self, names: &[String]) {
+        for (i, p) in self.players.iter_mut().enumerate() {
+            if let Some(name) = names.get(i) {
+                p.name = name.clone();
+            }
+        }
     }
 
     /// Regola dei segni: nel rettangolo i due giocatori vedono il campo

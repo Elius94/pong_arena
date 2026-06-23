@@ -5,7 +5,7 @@ use crate::net::*;
 use crate::render::{self, Frame};
 use crate::terminal::{poll_key, InputState, Key, TerminalGuard};
 use std::collections::VecDeque;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -36,7 +36,7 @@ fn target_aspect(n: usize) -> f32 {
 // ---------------------------------------------------------------------------
 // Composizione della schermata di gioco.
 // ---------------------------------------------------------------------------
-fn compose(snap: &Snapshot, my_id: usize, title_right: &str) -> String {
+fn compose(snap: &Snapshot, my_id: usize, title_right: &str, names: &[String]) -> String {
     let (cols, rows) = term_size();
     let layout = render::layout(cols, rows, target_aspect(snap.n));
     let (cw, ch, oc, or_) = match layout {
@@ -64,6 +64,7 @@ fn compose(snap: &Snapshot, my_id: usize, title_right: &str) -> String {
         Some(snap),
         my_id,
         status_owned.as_deref(),
+        names,
     ));
     if snap.phase_code == 2 {
         out.push_str(&render::game_over_overlay(
@@ -71,6 +72,7 @@ fn compose(snap: &Snapshot, my_id: usize, title_right: &str) -> String {
             rows as usize,
             snap.winner.max(0) as usize,
             my_id,
+            names,
         ));
     }
     out
@@ -170,12 +172,13 @@ fn render_lobby(port: u16, n_conn: usize, bots: usize) -> String {
 // ---------------------------------------------------------------------------
 // Host.
 // ---------------------------------------------------------------------------
-pub fn run_host(port: u16, bots: usize) -> std::io::Result<()> {
+pub fn run_host(port: u16, bots: usize, host_name: String) -> std::io::Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", port))?;
     listener.set_nonblocking(true)?;
 
     let _guard = TerminalGuard::new()?;
     let mut clients: Vec<TcpStream> = Vec::new();
+    let mut guest_names: Vec<String> = Vec::new();
     let mut last_count = usize::MAX;
 
     // --- Lobby ---
@@ -185,17 +188,39 @@ pub fn run_host(port: u16, bots: usize) -> std::io::Result<()> {
             match listener.accept() {
                 Ok((s, _addr)) => {
                     let _ = s.set_nodelay(true);
-                    // On Windows, accepted sockets inherit the listener's
-                    // non-blocking mode. Explicitly reset to blocking so that
-                    // the reader threads do not get WouldBlock immediately.
-                    let _ = s.set_nonblocking(false);
+                    // Mantieni non-blocking per leggere i NAME durante la lobby.
+                    let _ = s.set_nonblocking(true);
                     if 1 + clients.len() + bots < MAX_PLAYERS {
                         clients.push(s);
+                        guest_names.push(String::new()); // placeholder
                     }
                     // oltre il limite: il socket viene chiuso (drop)
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(_) => break,
+            }
+        }
+
+        // Leggi eventuali messaggi NAME dai client (non-blocking).
+        for (ci, client) in clients.iter_mut().enumerate() {
+            let mut buf = [0u8; 256];
+            loop {
+                match client.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let msg = String::from_utf8_lossy(&buf[..n]);
+                        for line in msg.lines() {
+                            if let Some(name) = line.strip_prefix("NAME ") {
+                                let name = name.trim().to_string();
+                                if !name.is_empty() {
+                                    guest_names[ci] = name;
+                                }
+                            }
+                        }
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
             }
         }
 
@@ -235,6 +260,21 @@ pub fn run_host(port: u16, bots: usize) -> std::io::Result<()> {
     let guests_used = (n - 1).min(clients.len());
     let bots_used = n - 1 - guests_used;
 
+    // Costruisci lista nomi: host + guests + bot.
+    let mut all_names: Vec<String> = Vec::with_capacity(n);
+    all_names.push(host_name);
+    for i in 0..guests_used {
+        let name = if guest_names[i].is_empty() {
+            format!("Giocatore {}", i + 1)
+        } else {
+            guest_names[i].clone()
+        };
+        all_names.push(name);
+    }
+    for i in 0..bots_used {
+        all_names.push(format!("Bot {}", i + 1));
+    }
+
     // Strutture indicizzate per pid.
     let mut writers: Vec<Option<TcpStream>> = (0..n).map(|_| None).collect();
     let mut inputs: Vec<Option<InputChannel>> = (0..n).map(|_| None).collect();
@@ -247,8 +287,14 @@ pub fn run_host(port: u16, bots: usize) -> std::io::Result<()> {
             continue;
         }
         let pid = i + 1;
+        // Torna a blocking mode per il reader thread.
+        let _ = s.set_nonblocking(false);
         let start_msg = format!("START {} {} {}\n", pid, n, LIVES_START);
         s.write_all(start_msg.as_bytes())?;
+        s.flush()?;
+        // Invia la lista nomi a questo guest.
+        let names_msg = format!("NAMES {}\n", all_names.join("|"));
+        s.write_all(names_msg.as_bytes())?;
         s.flush()?;
         let reader = BufReader::new(s.try_clone()?);
         inputs[pid] = Some(spawn_input_reader(reader));
@@ -262,12 +308,13 @@ pub fn run_host(port: u16, bots: usize) -> std::io::Result<()> {
 
     // --- Game loop ---
     let mut game = GameState::new(n, seed());
+    game.set_names(&all_names);
     let mut input = InputState::new();
     let mut last = Instant::now();
     let mut last_size = term_size();
     clear_trail();
 
-    let title = format!("HOST · {} giocatori · porta {}", n, port);
+    let title = format!("{} · {} giocatori · porta {}", all_names[0], n, port);
 
     loop {
         let now = Instant::now();
@@ -344,7 +391,7 @@ pub fn run_host(port: u16, bots: usize) -> std::io::Result<()> {
             last_size = size;
             render::flush("\x1b[2J")?;
         }
-        render::flush(&compose(&snap, 0, &title))?;
+        render::flush(&compose(&snap, 0, &title, &all_names))?;
 
         let elapsed = now.elapsed();
         if elapsed < FRAME {
@@ -358,16 +405,20 @@ pub fn run_host(port: u16, bots: usize) -> std::io::Result<()> {
 // ---------------------------------------------------------------------------
 // Guest.
 // ---------------------------------------------------------------------------
-pub fn run_guest(addr: &str, port: u16) -> std::io::Result<()> {
+pub fn run_guest(addr: &str, port: u16, my_name: String) -> std::io::Result<()> {
     println!("Connessione a {addr}:{port} …");
     let stream = TcpStream::connect((addr, port))?;
     stream.set_nodelay(true)?;
-    let writer = stream.try_clone()?;
+    let mut writer = stream.try_clone()?;
     let mut reader = BufReader::new(stream);
+
+    // Invia il proprio nickname all'host.
+    writer.write_all(format!("NAME {}\n", my_name).as_bytes())?;
+    writer.flush()?;
 
     // Attendi l'handshake START (durante la lobby arrivano righe LOBBY).
     println!("Connesso. In attesa che l'host avvii la partita…");
-    let (my_id, n) = loop {
+    let (my_id, n, mut all_names) = loop {
         let mut line = String::new();
         let read = reader.read_line(&mut line)?;
         if read == 0 {
@@ -379,7 +430,12 @@ pub fn run_guest(addr: &str, port: u16) -> std::io::Result<()> {
             let mut it = rest.split_whitespace();
             let id: usize = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
             let n: usize = it.next().and_then(|v| v.parse().ok()).unwrap_or(2);
-            break (id, n);
+            // La prossima riga dovrebbe essere NAMES.
+            let mut names_line = String::new();
+            reader.read_line(&mut names_line)?;
+            let names_str = names_line.trim().strip_prefix("NAMES ").unwrap_or("");
+            let names: Vec<String> = names_str.split('|').map(|s| s.to_string()).collect();
+            break (id, n, names);
         } else if let Some(rest) = line.strip_prefix("LOBBY ") {
             println!("  giocatori in lobby: {}", rest.trim());
         }
@@ -390,7 +446,13 @@ pub fn run_guest(addr: &str, port: u16) -> std::io::Result<()> {
     let mut writer = writer;
     let mut input = InputState::new();
     let mut last_size = term_size();
-    let title = format!("GUEST · giocatore {} di {}", my_id + 1, n);
+
+    // Completa i nomi mancanti con default.
+    while all_names.len() < n {
+        all_names.push(format!("Giocatore {}", all_names.len() + 1));
+    }
+
+    let title = format!("{} · giocatore {} di {}", all_names[my_id], my_id + 1, n);
     clear_trail();
 
     loop {
@@ -446,7 +508,7 @@ pub fn run_guest(addr: &str, port: u16) -> std::io::Result<()> {
                 last_size = size;
                 render::flush("\x1b[2J")?;
             }
-            render::flush(&compose(&snap, my_id, &title))?;
+            render::flush(&compose(&snap, my_id, &title, &all_names))?;
         }
 
         let elapsed = frame_start.elapsed();

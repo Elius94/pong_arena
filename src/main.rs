@@ -24,13 +24,14 @@ fn usage() -> ! {
         "Pong Arena — Pong LAN adattivo (2 = classico, 3+ = arena poligonale)\n\
          \n\
          USO:\n  \
-           pong_arena host [--port N] [--bots K]   avvia il server e la lobby\n  \
-           pong_arena join <ip> [--port N]         unisciti a un host in LAN\n\
+           pong_arena host [--port N] [--bots K] [--nickname NAME]\n  \
+           pong_arena join <ip> [--port N] [--nickname NAME]\n\
          \n\
          OPZIONI:\n  \
-           --port N    porta TCP (default {DEFAULT_PORT})\n  \
-           --bots K    riempi K posti con avversari IA (utile per provare da soli)\n  \
-           -h, --help  mostra questo aiuto\n\
+           --port N          porta TCP (default {DEFAULT_PORT})\n  \
+           --bots K          riempi K posti con avversari IA (utile per provare da soli)\n  \
+           --nickname NAME   nickname del giocatore (se omesso viene chiesto)\n  \
+           -h, --help        mostra questo aiuto\n\
          \n\
          COMANDI DI GIOCO:\n  \
            ←/→ · A/D · W/S  muovi la racchetta lungo il tuo lato\n  \
@@ -44,33 +45,45 @@ fn usage() -> ! {
     std::process::exit(2);
 }
 
-fn parse_opt_port(args: &[String], i: &mut usize) -> Option<u16> {
-    // Cerca --port tra gli argomenti rimanenti.
+fn prompt_nickname() -> String {
+    eprint!("Inserisci il tuo nickname: ");
+    let mut name = String::new();
+    std::io::stdin().read_line(&mut name).unwrap_or(0);
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        "Guest".to_string()
+    } else {
+        name
+    }
+}
+
+/// Parse opzioni comuni (--port, --nickname) per il caso join.
+/// Restituisce (port, nickname).
+fn parse_join_opts(args: &[String], i: &mut usize) -> (u16, String) {
     let mut port = DEFAULT_PORT;
-    let mut bots = 0usize;
+    let mut nickname: Option<String> = None;
     let mut k = *i;
-    let mut found_bots = None;
     while k < args.len() {
         match args[k].as_str() {
             "--port" => {
                 k += 1;
-                port = args.get(k)?.parse().ok()?;
+                if let Some(p) = args.get(k).and_then(|v| v.parse().ok()) {
+                    port = p;
+                }
             }
-            "--bots" => {
+            "--nickname" | "--name" => {
                 k += 1;
-                bots = args.get(k)?.parse().ok()?;
-                found_bots = Some(bots);
+                if let Some(n) = args.get(k) {
+                    nickname = Some(n.clone());
+                }
             }
-            _ => return None,
+            _ => break,
         }
         k += 1;
     }
-    let _ = found_bots;
     *i = k;
-    // Codifichiamo bots nei bit alti? No: gestiamo separatamente. Vedi main.
-    // (Questa funzione è usata solo per il caso join, dove bots è ignorato.)
-    let _ = bots;
-    Some(port)
+    let nick = nickname.unwrap_or_else(prompt_nickname);
+    (port, nick)
 }
 
 fn main() {
@@ -81,9 +94,10 @@ fn main() {
 
     match args[0].as_str() {
         "host" => {
-            // Parsing manuale di --port / --bots.
+            // Parsing manuale di --port / --bots / --nickname.
             let mut port = DEFAULT_PORT;
             let mut bots = 0usize;
+            let mut nickname: Option<String> = None;
             let mut i = 1;
             while i < args.len() {
                 match args[i].as_str() {
@@ -101,6 +115,13 @@ fn main() {
                             None => usage(),
                         };
                     }
+                    "--nickname" | "--name" => {
+                        i += 1;
+                        nickname = Some(match args.get(i) {
+                            Some(n) => n.clone(),
+                            None => usage(),
+                        });
+                    }
                     _ => usage(),
                 }
                 i += 1;
@@ -109,7 +130,8 @@ fn main() {
             if bots > 7 {
                 bots = 7;
             }
-            if let Err(e) = app::run_host(port, bots) {
+            let name = nickname.unwrap_or_else(|| "Host".to_string());
+            if let Err(e) = app::run_host(port, bots, name) {
                 eprintln!("Errore host: {e}");
                 std::process::exit(1);
             }
@@ -120,11 +142,8 @@ fn main() {
             }
             let addr = args[1].clone();
             let mut i = 2;
-            let port = match parse_opt_port(&args, &mut i) {
-                Some(p) => p,
-                None => usage(),
-            };
-            if let Err(e) = app::run_guest(&addr, port) {
+            let (port, name) = parse_join_opts(&args, &mut i);
+            if let Err(e) = app::run_guest(&addr, port, name) {
                 eprintln!("Errore guest: {e}");
                 std::process::exit(1);
             }
