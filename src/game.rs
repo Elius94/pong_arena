@@ -31,6 +31,7 @@ pub const BOT_JITTER: f32 = 0.10;        // imprecisione casuale dei bot
 
 // ---- Regole ---------------------------------------------------------------
 pub const COUNTDOWN: f32 = 1.6;
+#[allow(dead_code)]
 pub const LIVES_START: i32 = 7; // "schiaccia 7": parti con 7 vite
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -111,16 +112,18 @@ pub struct GameState {
     pub bullets: Vec<Bullet>,
     last_hitter: Option<usize>,
     rng: u64,
+    /// Vite iniziali salvate per il restart.
+    pub start_lives: i32,
 }
 
 impl GameState {
-    pub fn new(n_players: usize, seed: u64) -> GameState {
+    pub fn new(n_players: usize, seed: u64, lives: i32) -> GameState {
         let arena = Arena::new(n_players);
         let n = arena.players;
         let players = (0..n)
             .map(|_i| Player {
                 c: 0.5,
-                lives: LIVES_START,
+                lives,
                 alive: true,
                 connected: true,
                 name: String::new(),
@@ -139,6 +142,7 @@ impl GameState {
             bullets: Vec::new(),
             last_hitter: None,
             rng: seed | 1,
+            start_lives: lives,
         };
         g.serve();
         g
@@ -201,7 +205,7 @@ impl GameState {
         self.arena = Arena::new(n);
         for p in self.players.iter_mut() {
             if p.connected {
-                p.lives = LIVES_START;
+                p.lives = self.start_lives;
                 p.alive = true;
                 p.c = 0.5;
             }
@@ -647,7 +651,7 @@ mod tests {
 
     #[test]
     fn snapshot_roundtrip() {
-        let g = GameState::new(4, 12345);
+        let g = GameState::new(4, 12345, LIVES_START);
         let s = g.snapshot();
         let back = Snapshot::decode(&s.encode()).expect("decode");
         assert_eq!(s.n, back.n);
@@ -677,7 +681,7 @@ mod tests {
 
     #[test]
     fn countdown_then_play() {
-        let mut g = GameState::new(3, 7);
+        let mut g = GameState::new(3, 7, LIVES_START);
         assert!(matches!(g.phase, Phase::Countdown(_)));
         g.step(COUNTDOWN + 0.1);
         assert!(matches!(g.phase, Phase::Playing));
@@ -686,7 +690,7 @@ mod tests {
 
     #[test]
     fn missing_paddle_costs_a_life() {
-        let mut g = GameState::new(3, 99);
+        let mut g = GameState::new(3, 99, LIVES_START);
         g.phase = Phase::Playing;
         // sparo la palla dritta contro il lato del giocatore 0, lontano dalla
         // racchetta (che tengo al centro), così deve subire un punto.
@@ -705,7 +709,7 @@ mod tests {
 
     #[test]
     fn elimination_closes_wall_and_can_win() {
-        let mut g = GameState::new(3, 5);
+        let mut g = GameState::new(3, 5, LIVES_START);
         // svuoto le vite del giocatore 2
         g.players[2].lives = 1;
         // forzo l'eliminazione concedendo
@@ -719,7 +723,7 @@ mod tests {
 
     #[test]
     fn last_player_standing_wins() {
-        let mut g = GameState::new(3, 5);
+        let mut g = GameState::new(3, 5, LIVES_START);
         g.players[1].lives = 1;
         g.concede(1);
         g.players[2].lives = 1;
@@ -729,7 +733,7 @@ mod tests {
 
     #[test]
     fn full_game_converges_to_a_winner() {
-        let mut g = GameState::new(3, 0xDEAD_BEEF);
+        let mut g = GameState::new(3, 0xDEAD_BEEF, LIVES_START);
         let mut frames = 0;
         loop {
             g.step(1.0 / 60.0);
@@ -745,7 +749,7 @@ mod tests {
 
     #[test]
     fn paddle_clamped_within_edge() {
-        let mut g = GameState::new(5, 1);
+        let mut g = GameState::new(5, 1, LIVES_START);
         for _ in 0..1000 {
             g.apply_input(0, 1, 1.0 / 60.0);
         }
@@ -758,7 +762,7 @@ mod tests {
 
     #[test]
     fn fire_consumes_ammo_and_creates_bullet() {
-        let mut g = GameState::new(2, 42);
+        let mut g = GameState::new(2, 42, LIVES_START);
         g.phase = Phase::Playing;
         assert_eq!(g.weapons[0].ammo, AMMO_MAX);
         g.apply_action(0, true, false);
@@ -768,7 +772,7 @@ mod tests {
 
     #[test]
     fn grenade_freezes_opponents() {
-        let mut g = GameState::new(3, 42);
+        let mut g = GameState::new(3, 42, LIVES_START);
         g.phase = Phase::Playing;
         g.weapons[0].grenades = 1;
         g.apply_action(0, false, true);
@@ -780,7 +784,7 @@ mod tests {
 
     #[test]
     fn ammo_reloads_over_time() {
-        let mut g = GameState::new(2, 1);
+        let mut g = GameState::new(2, 1, LIVES_START);
         g.phase = Phase::Playing;
         g.weapons[0].ammo = 0;
         g.weapons[0].reload_acc = 0.0;
@@ -794,7 +798,7 @@ mod tests {
 
     #[test]
     fn slow_effect_reduces_paddle_speed() {
-        let mut g = GameState::new(2, 1);
+        let mut g = GameState::new(2, 1, LIVES_START);
         g.phase = Phase::Playing;
         g.weapons[0].slow_level = 1.0; // massimo rallentamento
         let c_before = g.players[0].c;
@@ -811,7 +815,7 @@ mod tests {
 
     #[test]
     fn scoring_awards_grenade_to_last_hitter() {
-        let mut g = GameState::new(2, 7);
+        let mut g = GameState::new(2, 7, LIVES_START);
         g.phase = Phase::Playing;
         g.last_hitter = Some(1);
         let before = g.weapons[1].grenades;

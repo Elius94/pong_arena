@@ -172,7 +172,7 @@ fn render_lobby(port: u16, n_conn: usize, bots: usize) -> String {
 // ---------------------------------------------------------------------------
 // Host.
 // ---------------------------------------------------------------------------
-pub fn run_host(port: u16, bots: usize, host_name: String) -> std::io::Result<()> {
+pub fn run_host(port: u16, bots: usize, host_name: String, lives: i32) -> std::io::Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", port))?;
     listener.set_nonblocking(true)?;
 
@@ -289,7 +289,7 @@ pub fn run_host(port: u16, bots: usize, host_name: String) -> std::io::Result<()
         let pid = i + 1;
         // Torna a blocking mode per il reader thread.
         let _ = s.set_nonblocking(false);
-        let start_msg = format!("START {} {} {}\n", pid, n, LIVES_START);
+        let start_msg = format!("START {} {} {} {}\n", pid, n, lives, all_names[pid]);
         s.write_all(start_msg.as_bytes())?;
         s.flush()?;
         // Invia la lista nomi a questo guest.
@@ -307,7 +307,7 @@ pub fn run_host(port: u16, bots: usize, host_name: String) -> std::io::Result<()
     let _ = bots_used;
 
     // --- Game loop ---
-    let mut game = GameState::new(n, seed());
+    let mut game = GameState::new(n, seed(), lives);
     game.set_names(&all_names);
     let mut input = InputState::new();
     let mut last = Instant::now();
@@ -430,6 +430,7 @@ pub fn run_guest(addr: &str, port: u16, my_name: String) -> std::io::Result<()> 
             let mut it = rest.split_whitespace();
             let id: usize = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
             let n: usize = it.next().and_then(|v| v.parse().ok()).unwrap_or(2);
+            // Ignora eventuali campi extra (lives, name) nel messaggio START.
             // La prossima riga dovrebbe essere NAMES.
             let mut names_line = String::new();
             reader.read_line(&mut names_line)?;

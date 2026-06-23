@@ -498,7 +498,7 @@ mod tests {
     #[test]
     fn draw_does_not_panic_for_many_sides() {
         for n in 2..=8 {
-            let g = GameState::new(n, 1);
+            let g = GameState::new(n, 1, LIVES_START);
             let snap = g.snapshot();
             let mut f = Frame::new(80, 24);
             let trail = VecDeque::new();
