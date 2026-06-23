@@ -188,8 +188,10 @@ pub fn run_host(port: u16, bots: usize, host_name: String, lives: i32) -> std::i
             match listener.accept() {
                 Ok((s, _addr)) => {
                     let _ = s.set_nodelay(true);
-                    // Mantieni non-blocking per leggere i NAME durante la lobby.
-                    let _ = s.set_nonblocking(true);
+                    // Timeout brevissimo sui read per la lobby: non usiamo
+                    // non-blocking perché su Windows può impedire i write
+                    // successivi (i write devono restare blocking).
+                    let _ = s.set_read_timeout(Some(Duration::from_millis(1)));
                     if 1 + clients.len() + bots < MAX_PLAYERS {
                         clients.push(s);
                         guest_names.push(String::new()); // placeholder
@@ -218,7 +220,12 @@ pub fn run_host(port: u16, bots: usize, host_name: String, lives: i32) -> std::i
                             }
                         }
                     }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(ref e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut =>
+                    {
+                        break
+                    }
                     Err(_) => break,
                 }
             }
@@ -287,8 +294,8 @@ pub fn run_host(port: u16, bots: usize, host_name: String, lives: i32) -> std::i
             continue;
         }
         let pid = i + 1;
-        // Torna a blocking mode per il reader thread.
-        let _ = s.set_nonblocking(false);
+        // Rimuovi il timeout di lettura: da qui in poi tutto è blocking.
+        let _ = s.set_read_timeout(None);
         let start_msg = format!("START {} {} {} {}\n", pid, n, lives, all_names[pid]);
         s.write_all(start_msg.as_bytes())?;
         s.flush()?;
