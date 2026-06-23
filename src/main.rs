@@ -103,18 +103,16 @@ fn main() {
     // Se zero argomenti → menu interattivo TUI.
     if args.is_empty() {
         match menu::run_menu() {
-            Some((menu::MenuResult::Host, cfg)) => {
-                if let Err(e) = app::run_host(cfg.port, cfg.bots, cfg.nickname, cfg.lives) {
+            Some(menu::MenuResult::Host { port, bots, lives, nickname }) => {
+                let name = if nickname.is_empty() { "Host".to_string() } else { nickname };
+                if let Err(e) = app::run_host(port, bots, name, lives) {
                     eprintln!("Errore host: {e}");
                     std::process::exit(1);
                 }
             }
-            Some((menu::MenuResult::Join, cfg)) => {
-                if cfg.addr.is_empty() {
-                    eprintln!("Indirizzo IP non fornito.");
-                    std::process::exit(1);
-                }
-                if let Err(e) = app::run_guest(&cfg.addr, cfg.port, cfg.nickname) {
+            Some(menu::MenuResult::Join { addr, port, nickname }) => {
+                let name = if nickname.is_empty() { "Guest".to_string() } else { nickname };
+                if let Err(e) = app::run_guest(&addr, port, name) {
                     eprintln!("Errore guest: {e}");
                     std::process::exit(1);
                 }
