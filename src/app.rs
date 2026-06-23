@@ -361,6 +361,7 @@ pub fn run_host(port: u16, bots: usize, host_name: String, lives: i32) -> std::i
         for pid in 1..n {
             if is_bot[pid] {
                 game.bot_step(pid, dt);
+                game.bot_action(pid);
             } else if let Some(ch) = &inputs[pid] {
                 game.apply_input(pid, ch.get().intent, dt);
                 let (fire, grenade) = guest_actions[pid];
@@ -384,7 +385,9 @@ pub fn run_host(port: u16, bots: usize, host_name: String, lives: i32) -> std::i
 
         // Scia + render locale.
         if snap.phase_code == 1 {
-            push_trail((snap.ball.x, snap.ball.y));
+            if let Some(b) = snap.balls.first() {
+                push_trail((b.x, b.y));
+            }
         }
         let size = term_size();
         if size != last_size {
@@ -502,7 +505,9 @@ pub fn run_guest(addr: &str, port: u16, my_name: String) -> std::io::Result<()> 
 
         if let Some(snap) = chan.get() {
             if snap.phase_code == 1 {
-                push_trail((snap.ball.x, snap.ball.y));
+                if let Some(b) = snap.balls.first() {
+                    push_trail((b.x, b.y));
+                }
             }
             let size = term_size();
             if size != last_size {

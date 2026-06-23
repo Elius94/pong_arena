@@ -209,11 +209,10 @@ pub fn draw_arena(f: &mut Frame, snap: &Snapshot, my_id: usize, trail: &VecDeque
                     f.line(pa, pb, 0.8, WALL_DIM);
                     let base_col = player_color(pid);
                     let col = if pid < snap.weapons.len() {
-                        let (_, slow_t, freeze_t, _) = snap.weapons[pid];
+                        let (_, slow_t, freeze_t, _, _) = snap.weapons[pid];
                         if freeze_t > 0.0 {
                             mix(base_col, FREEZE_TINT, 0.75)
                         } else if slow_t > 0.0 {
-                            // L'intensità della tinta arancio cresce col livello di slow
                             mix(base_col, SLOW_TINT, 0.3 + 0.55 * slow_t)
                         } else {
                             base_col
@@ -249,7 +248,22 @@ pub fn draw_arena(f: &mut Frame, snap: &Snapshot, my_id: usize, trail: &VecDeque
         f.disc(px, py, r, player_color(shooter));
     }
 
-    // Scia + palla (nascoste a fine partita).
+    // Item box.
+    for &(pos, kind) in &snap.items {
+        let (ix, iy) = view.px(pos);
+        let r = (ITEM_R * view.scale).max(4.0);
+        let col = item_color(kind);
+        f.fill(
+            (ix - r) as i32,
+            (iy - r) as i32,
+            (ix + r) as i32 + 1,
+            (iy + r) as i32 + 1,
+            col,
+        );
+        f.disc(ix, iy, (r * 0.35).max(1.5), (255, 255, 255));
+    }
+
+    // Scia + palline (nascoste a fine partita).
     if snap.phase_code != 2 {
         let n_tr = trail.len();
         for (i, &(tx, ty)) in trail.iter().enumerate() {
@@ -258,8 +272,10 @@ pub fn draw_arena(f: &mut Frame, snap: &Snapshot, my_id: usize, trail: &VecDeque
             let (px, py) = view.px(v2(tx, ty));
             f.disc(px, py, BALL_R * view.scale * 0.7, cc);
         }
-        let (bx, by) = view.px(snap.ball);
-        f.disc(bx, by, BALL_R * view.scale, BALL);
+        for &ball_pos in &snap.balls {
+            let (bx, by) = view.px(ball_pos);
+            f.disc(bx, by, BALL_R * view.scale, BALL);
+        }
     }
 
     // Conto alla rovescia gigante.
@@ -269,6 +285,14 @@ pub fn draw_arena(f: &mut Frame, snap: &Snapshot, my_id: usize, trail: &VecDeque
             let s = (f.h as i32 / 9).max(3);
             f.number(k, f.w as i32 / 2, f.h as i32 / 2 - 2 * s, s, COUNT_C);
         }
+    }
+}
+
+fn item_color(kind: u8) -> Rgb {
+    match kind {
+        0 => (255, 210, 50),  // Multiball: oro
+        1 => (180, 100, 255), // Paralysis: viola
+        _ => (50, 220, 220),  // Capture: acqua
     }
 }
 
@@ -373,8 +397,8 @@ pub fn chrome(
         if my_id < sc.players.len() {
             let (_, lives, alive) = sc.players[my_id];
             let mine = if alive {
-                let (ammo, _, _, grenades) =
-                    sc.weapons.get(my_id).copied().unwrap_or((AMMO_MAX, 0.0, 0.0, 0));
+                let (ammo, _, _, grenades, cap) =
+                    sc.weapons.get(my_id).copied().unwrap_or((AMMO_MAX, 0.0, 0.0, 0, 0));
                 let bar: String = (0..AMMO_MAX as usize)
                     .map(|i| if i < ammo as usize { '█' } else { '░' })
                     .collect();
@@ -383,7 +407,12 @@ pub fn chrome(
                 } else {
                     String::new()
                 };
-                format!("{} vite  {}{}", lives.max(0), bar, grenade_part)
+                let cap_part = match cap {
+                    1 => "  ◎",  // capture_ready: aspetta pallina
+                    2 => "  ◉",  // palla trattenuta
+                    _ => "",
+                };
+                format!("{} vite  {}{}{}", lives.max(0), bar, grenade_part, cap_part)
             } else {
                 "eliminato".to_string()
             };

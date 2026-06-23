@@ -11,54 +11,65 @@ use crate::geom::*;
 // ---- Palla ----------------------------------------------------------------
 pub const BALL_R: f32 = 2.0;
 pub const BASE_SPEED: f32 = 82.0;
-pub const MAX_SPEED: f32 = 158.0;
-pub const SPEEDUP: f32 = 1.045; // accelerazione ad ogni colpo di racchetta
-pub const MAX_BOUNCE: f32 = 1.0472; // ±60° rispetto alla normale del lato
+pub const MAX_SPEED: f32 = 180.0;
+pub const SPEEDUP: f32 = 1.045;
+pub const MAX_BOUNCE: f32 = 1.0472; // ±60°
 const EPS: f32 = 0.01;
+
+// ---- Progressione velocità ------------------------------------------------
+pub const SPEED_RAMP_RATE: f32 = 0.3;  // incremento minSpeed per secondo
+pub const SPEED_RAMP_MAX: f32 = 50.0;  // cap sopra BASE_SPEED
 
 // ---- Armi -----------------------------------------------------------------
 pub const AMMO_MAX: i32 = 10;
-pub const AMMO_RELOAD_RATE: f32 = 0.2;   // munizioni al secondo (1 ogni 5 s)
+pub const AMMO_RELOAD_RATE: f32 = 0.2;
 pub const BULLET_SPEED: f32 = 240.0;
 pub const BULLET_R: f32 = 1.2;
-pub const SLOW_PER_HIT: f32 = 0.4;       // incremento slow per colpo (0.0–1.0, max a 3 colpi)
-pub const SLOW_DECAY_RATE: f32 = 0.12;   // decadimento slow al secondo (recupero ~8 s)
-pub const SLOW_MIN_SPEED: f32 = 0.25;    // velocità minima a slow_level=1.0
-pub const BULLET_DEFLECTION: f32 = 0.7;  // deviazione tangenziale in base al movimento (~35°)
-pub const FREEZE_DURATION: f32 = 2.0;    // secondi di blocco da granata
+pub const SLOW_PER_HIT: f32 = 0.4;
+pub const SLOW_DECAY_RATE: f32 = 0.12;
+pub const SLOW_MIN_SPEED: f32 = 0.25;
+pub const BULLET_DEFLECTION: f32 = 0.7;
+pub const FREEZE_DURATION: f32 = 2.0;
 pub const GRENADES_MAX: i32 = 2;
-pub const BOT_JITTER: f32 = 0.10;        // imprecisione casuale dei bot
+pub const BOT_JITTER: f32 = 0.10;
+
+// ---- Item box -------------------------------------------------------------
+pub const ITEM_R: f32 = 5.0;
+pub const ITEM_INTERVAL: f32 = 15.0;   // secondi tra spawn
+pub const ITEM_MAX: usize = 3;
+pub const PARALYSIS_DURATION: f32 = 3.0;
 
 // ---- Regole ---------------------------------------------------------------
 pub const COUNTDOWN: f32 = 1.6;
 #[allow(dead_code)]
-pub const LIVES_START: i32 = 7; // "schiaccia 7": parti con 7 vite
+pub const LIVES_START: i32 = 7;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Phase {
     Countdown(f32),
     Playing,
-    GameOver(usize), // id del vincitore
+    GameOver(usize),
 }
 
 #[derive(Clone, Debug)]
 pub struct Player {
-    pub c: f32,       // centro racchetta in parametro-di-lato [0,1]
-    pub lives: i32,   // vite residue
-    pub alive: bool,  // ancora in gioco
+    pub c: f32,
+    pub lives: i32,
+    pub alive: bool,
     pub connected: bool,
-    pub name: String, // nickname del giocatore
+    pub name: String,
 }
 
 /// Stato delle armi di un singolo giocatore.
 #[derive(Clone, Debug)]
 pub struct WeaponState {
-    pub ammo: i32,          // munizioni fucile (0–AMMO_MAX)
-    pub reload_acc: f32,    // accumulatore frazionario per la ricarica
-    pub slow_level: f32,    // livello di rallentamento subito (0.0 = normale, 1.0 = massimo)
-    pub last_intent: i32,   // ultimo intento di movimento, usato per deviare i proiettili
-    pub freeze_timer: f32,  // tempo rimanente di blocco subito (granata)
-    pub grenades: i32,      // granate disponibili (0–GRENADES_MAX)
+    pub ammo: i32,
+    pub reload_acc: f32,
+    pub slow_level: f32,
+    pub last_intent: i32,
+    pub freeze_timer: f32,
+    pub grenades: i32,
+    pub capture_ready: bool, // item Capture raccolto, aspetta la prossima pallina
 }
 
 impl WeaponState {
@@ -70,19 +81,40 @@ impl WeaponState {
             last_intent: 0,
             freeze_timer: 0.0,
             grenades: 0,
+            capture_ready: false,
         }
     }
 }
 
-/// Proiettile in volo nell'arena.
+/// Pallina in gioco.
+pub struct Ball {
+    pub pos: V2,
+    pub vel: V2,
+    pub captured_by: Option<usize>, // Some(pid) = trattenuta, vel = 0
+}
+
+/// Proiettile in volo.
 pub struct Bullet {
     pub pos: V2,
     pub vel: V2,
     pub shooter: usize,
 }
 
+/// Tipo di item box.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ItemKind {
+    Multiball = 0,
+    Paralysis = 1,
+    Capture   = 2,
+}
+
+pub struct Item {
+    pub pos: V2,
+    pub kind: ItemKind,
+}
+
 // ---------------------------------------------------------------------------
-// PRNG xorshift* (nessuna dipendenza esterna).
+// PRNG xorshift*
 // ---------------------------------------------------------------------------
 #[inline]
 fn xorshift(s: &mut u64) -> u64 {
@@ -98,21 +130,21 @@ fn rand_unit(s: &mut u64) -> f32 {
     (xorshift(s) >> 40) as f32 / (1u64 << 24) as f32
 }
 
-/// Stato completo della partita. Vive solo lato host (server autoritativo).
+/// Stato completo della partita (vive solo lato host).
 pub struct GameState {
     pub arena: Arena,
-    pub ball_p: V2,
-    pub ball_v: V2,
+    pub balls: Vec<Ball>,
     pub phase: Phase,
     pub players: Vec<Player>,
-    /// Segno che converte l'intento del giocatore (su/destra = +1) in
-    /// incremento del parametro di lato, coerente con la vista del giocatore.
     pub param_sign: Vec<f32>,
     pub weapons: Vec<WeaponState>,
     pub bullets: Vec<Bullet>,
+    pub items: Vec<Item>,
+    pub items_enabled: bool,
+    pub item_spawn_timer: f32,
+    pub play_time: f32,
     last_hitter: Option<usize>,
     rng: u64,
-    /// Vite iniziali salvate per il restart.
     pub start_lives: i32,
 }
 
@@ -121,7 +153,7 @@ impl GameState {
         let arena = Arena::new(n_players);
         let n = arena.players;
         let players = (0..n)
-            .map(|_i| Player {
+            .map(|_| Player {
                 c: 0.5,
                 lives,
                 alive: true,
@@ -133,13 +165,16 @@ impl GameState {
         let weapons = (0..n).map(|_| WeaponState::new()).collect();
         let mut g = GameState {
             arena,
-            ball_p: v2(0.0, 0.0),
-            ball_v: v2(0.0, 0.0),
+            balls: Vec::new(),
             phase: Phase::Countdown(COUNTDOWN),
             players,
             param_sign,
             weapons,
             bullets: Vec::new(),
+            items: Vec::new(),
+            items_enabled: false,
+            item_spawn_timer: 0.0,
+            play_time: 0.0,
             last_hitter: None,
             rng: seed | 1,
             start_lives: lives,
@@ -148,7 +183,6 @@ impl GameState {
         g
     }
 
-    /// Assegna i nickname ai giocatori.
     pub fn set_names(&mut self, names: &[String]) {
         for (i, p) in self.players.iter_mut().enumerate() {
             if let Some(name) = names.get(i) {
@@ -157,10 +191,6 @@ impl GameState {
         }
     }
 
-    /// Regola dei segni: nel rettangolo i due giocatori vedono il campo
-    /// orizzontale (sinistra/destra), quindi il segno è opposto; nel poligono
-    /// ogni giocatore vede il proprio lato in basso con il parametro che cresce
-    /// verso destra, quindi il segno è sempre positivo.
     fn compute_param_sign(n: usize) -> Vec<f32> {
         if n <= 2 {
             vec![1.0, -1.0]
@@ -182,24 +212,27 @@ impl GameState {
             .filter(|(_, p)| p.alive)
             .map(|(i, _)| i)
             .collect();
-        if alive.len() == 1 {
-            Some(alive[0])
-        } else {
-            None
-        }
+        if alive.len() == 1 { Some(alive[0]) } else { None }
     }
 
-    /// Reimposta palla al centro e lancia verso una direzione casuale.
+    fn current_min_speed(&self) -> f32 {
+        BASE_SPEED + (self.play_time * SPEED_RAMP_RATE).min(SPEED_RAMP_MAX)
+    }
+
     fn serve(&mut self) {
-        self.ball_p = v2(0.0, 0.0);
+        let speed = self.current_min_speed();
         let a = rand_unit(&mut self.rng) * std::f32::consts::TAU;
-        self.ball_v = v2(a.cos(), a.sin()) * BASE_SPEED;
+        self.balls.clear();
+        self.balls.push(Ball {
+            pos: v2(0.0, 0.0),
+            vel: v2(a.cos(), a.sin()) * speed,
+            captured_by: None,
+        });
         self.phase = Phase::Countdown(COUNTDOWN);
         self.bullets.clear();
         self.last_hitter = None;
     }
 
-    /// Ricomincia da capo (riapre i lati eliminati, ripristina le vite).
     pub fn restart(&mut self) {
         let n = self.players.len();
         self.arena = Arena::new(n);
@@ -210,7 +243,6 @@ impl GameState {
                 p.c = 0.5;
             }
         }
-        // chi era disconnesso resta fuori
         for (pid, p) in self.players.iter().enumerate() {
             if !p.connected {
                 let wi = self.arena.player_wall[pid];
@@ -226,6 +258,10 @@ impl GameState {
             *w = WeaponState::new();
         }
         self.bullets.clear();
+        self.items.clear();
+        self.items_enabled = false;
+        self.item_spawn_timer = 0.0;
+        self.play_time = 0.0;
         self.last_hitter = None;
         self.serve();
         if let Some(w) = self.sole_survivor() {
@@ -233,8 +269,6 @@ impl GameState {
         }
     }
 
-    /// Applica l'intento di movimento del giocatore `pid` (+1 = su/destra).
-    /// La velocità è ridotta proporzionalmente allo slow_level, azzerata se congelato.
     pub fn apply_input(&mut self, pid: usize, intent: i32, dt: f32) {
         if !self.players[pid].alive {
             return;
@@ -252,7 +286,6 @@ impl GameState {
         self.players[pid].c = (self.players[pid].c + delta).clamp(lo, hi);
     }
 
-    /// Spara un colpo o usa una granata. Le azioni sono edge-triggered (un frame).
     pub fn apply_action(&mut self, pid: usize, fire: bool, grenade: bool) {
         if !matches!(self.phase, Phase::Playing) {
             return;
@@ -260,23 +293,36 @@ impl GameState {
         if !self.players[pid].alive {
             return;
         }
-        if fire && self.weapons[pid].ammo > 0 {
-            self.weapons[pid].ammo -= 1;
-            let wi = self.arena.player_wall[pid];
-            let w = self.arena.walls[wi];
-            let c = self.players[pid].c;
-            let origin = w.point(c) + w.n * (BULLET_R + EPS);
-            // Il proiettile si devia in base al movimento: muoversi mentre si
-            // spara cambia l'angolo fino a ~35°, utile per colpire avversari
-            // non esattamente di fronte nel multiplayer a N giocatori.
-            let intent = self.weapons[pid].last_intent as f32;
-            let tangent = (w.b - w.a).norm();
-            let raw_dir = w.n + tangent * (intent * self.param_sign[pid] * BULLET_DEFLECTION);
-            self.bullets.push(Bullet {
-                pos: origin,
-                vel: raw_dir.norm() * BULLET_SPEED,
-                shooter: pid,
-            });
+        if fire {
+            // Se il giocatore tiene una palla catturata, rilanciala.
+            let held = self.balls.iter().position(|b| b.captured_by == Some(pid));
+            if let Some(bi) = held {
+                let wi = self.arena.player_wall[pid];
+                let w = self.arena.walls[wi];
+                let intent = self.weapons[pid].last_intent as f32;
+                let tangent = (w.b - w.a).norm();
+                let raw_dir = w.n + tangent * (intent * self.param_sign[pid] * MAX_BOUNCE);
+                let speed = self.current_min_speed();
+                self.balls[bi].vel = raw_dir.norm() * speed;
+                self.balls[bi].captured_by = None;
+                self.balls[bi].pos = w.point(self.players[pid].c) + w.n * (BALL_R * 2.0 + EPS);
+                self.last_hitter = Some(pid);
+            } else if self.weapons[pid].ammo > 0 {
+                self.weapons[pid].ammo -= 1;
+                let wi = self.arena.player_wall[pid];
+                let w = self.arena.walls[wi];
+                let c = self.players[pid].c;
+                let origin = w.point(c) + w.n * (BULLET_R + EPS);
+                let intent = self.weapons[pid].last_intent as f32;
+                let tangent = (w.b - w.a).norm();
+                let raw_dir =
+                    w.n + tangent * (intent * self.param_sign[pid] * BULLET_DEFLECTION);
+                self.bullets.push(Bullet {
+                    pos: origin,
+                    vel: raw_dir.norm() * BULLET_SPEED,
+                    shooter: pid,
+                });
+            }
         }
         if grenade && self.weapons[pid].grenades > 0 {
             self.weapons[pid].grenades -= 1;
@@ -288,30 +334,85 @@ impl GameState {
         }
     }
 
-    /// Muove un bot verso la proiezione della palla sul proprio lato.
+    /// Bot: decide se sparare, usare granata o rilasciare la palla trattenuta.
+    /// Va chiamato ogni frame, separatamente da `bot_step`.
+    pub fn bot_action(&mut self, pid: usize) {
+        if !self.players[pid].alive || !matches!(self.phase, Phase::Playing) {
+            return;
+        }
+        // Se trattiene una palla catturata, rilasciala subito mirando verso l'avversario più vicino.
+        let holding = self.balls.iter().any(|b| b.captured_by == Some(pid));
+        if holding {
+            // Orienta l'intento verso l'avversario vivo più vicino al centro del proprio lato.
+            let wi = self.arena.player_wall[pid];
+            let w = self.arena.walls[wi];
+            let mid = w.point(self.players[pid].c);
+            let best_dir = (0..self.players.len())
+                .filter(|&o| o != pid && self.players[o].alive)
+                .map(|o| {
+                    let ow = self.arena.player_wall[o];
+                    let owall = self.arena.walls[ow];
+                    let target = owall.point(self.players[o].c);
+                    (target - mid).norm()
+                })
+                .next();
+            if let Some(dir) = best_dir {
+                // Converti la direzione in intent (+1/-1) lungo il lato.
+                let tangent = (w.b - w.a).norm();
+                let proj = dir.dot(tangent) * self.param_sign[pid];
+                self.weapons[pid].last_intent = if proj > 0.1 { 1 } else if proj < -0.1 { -1 } else { 0 };
+            }
+            self.apply_action(pid, true, false);
+            return;
+        }
+        // Spara con probabilità ~0.5/s (circa una volta ogni 2 secondi).
+        let fire = self.weapons[pid].ammo > 0 && rand_unit(&mut self.rng) < 0.5 / 60.0;
+        // Usa granata con probabilità ~0.15/s (circa una volta ogni 7 secondi).
+        let grenade =
+            self.weapons[pid].grenades > 0 && rand_unit(&mut self.rng) < 0.15 / 60.0;
+        if fire || grenade {
+            self.apply_action(pid, fire, grenade);
+        }
+    }
+
+    /// Bot: insegue la palla in avvicinamento più vicina al proprio lato.
     pub fn bot_step(&mut self, pid: usize, dt: f32) {
         if !self.players[pid].alive {
             return;
         }
         let wi = self.arena.player_wall[pid];
         let w = self.arena.walls[wi];
-        // insegui solo se la palla si avvicina al lato
-        let approaching = self.ball_v.dot(w.n) < 0.0;
-        let target = if approaching && matches!(self.phase, Phase::Playing) {
-            let base = project_t(self.ball_p, w.a, w.b).clamp(0.0, 1.0);
-            // Piccola imprecisione casuale per evitare loop infiniti tra bot.
-            let jitter = (rand_unit(&mut self.rng) - 0.5) * 2.0 * BOT_JITTER;
-            (base + jitter).clamp(PADDLE_FRAC, 1.0 - PADDLE_FRAC)
+        let mut best: Option<(f32, f32)> = None; // (projected_t, dist_to_wall)
+        for ball in &self.balls {
+            if ball.captured_by.is_some() {
+                continue;
+            }
+            if ball.vel.dot(w.n) < 0.0 {
+                let t = project_t(ball.pos, w.a, w.b).clamp(0.0, 1.0);
+                let dist = (ball.pos - w.a).dot(w.n);
+                let closer = match best {
+                    None => true,
+                    Some((_, d)) => dist < d,
+                };
+                if closer {
+                    best = Some((t, dist));
+                }
+            }
+        }
+        let target = if let Some((t, _)) = best {
+            if matches!(self.phase, Phase::Playing) {
+                let jitter = (rand_unit(&mut self.rng) - 0.5) * 2.0 * BOT_JITTER;
+                (t + jitter).clamp(PADDLE_FRAC, 1.0 - PADDLE_FRAC)
+            } else {
+                0.5
+            }
         } else {
             0.5
         };
-        let lo = PADDLE_FRAC;
-        let hi = 1.0 - PADDLE_FRAC;
         let c = self.players[pid].c;
-        let max_step = PADDLE_PARAM_SPEED * 0.85 * dt; // un filo più lenti di un umano
-        let diff = target - c;
-        let step = diff.clamp(-max_step, max_step);
-        self.players[pid].c = (c + step).clamp(lo, hi);
+        let max_step = PADDLE_PARAM_SPEED * 0.85 * dt;
+        let step = (target - c).clamp(-max_step, max_step);
+        self.players[pid].c = (c + step).clamp(PADDLE_FRAC, 1.0 - PADDLE_FRAC);
     }
 
     pub fn mark_disconnected(&mut self, pid: usize) {
@@ -324,18 +425,19 @@ impl GameState {
         }
         if let Some(w) = self.sole_survivor() {
             self.phase = Phase::GameOver(w);
-            self.ball_v = v2(0.0, 0.0);
+            for ball in &mut self.balls {
+                ball.vel = v2(0.0, 0.0);
+            }
         }
     }
 
     fn eliminate(&mut self, pid: usize) {
         self.players[pid].alive = false;
         let wi = self.arena.player_wall[pid];
-        self.arena.walls[wi].owner = None; // il lato diventa muro solido
+        self.arena.walls[wi].owner = None;
     }
 
     fn concede(&mut self, pid: usize) {
-        // Chi ha segnato riceve una granata.
         if let Some(scorer) = self.last_hitter {
             if scorer != pid && self.players[scorer].alive {
                 self.weapons[scorer].grenades =
@@ -345,18 +447,24 @@ impl GameState {
         if self.players[pid].lives > 0 {
             self.players[pid].lives -= 1;
         }
+        // Abilita item box dopo la prima vita persa.
+        if !self.items_enabled && self.players.iter().any(|p| p.lives < self.start_lives) {
+            self.items_enabled = true;
+            self.item_spawn_timer = ITEM_INTERVAL;
+        }
         if self.players[pid].lives <= 0 && self.players[pid].alive {
             self.eliminate(pid);
         }
         if let Some(w) = self.sole_survivor() {
             self.phase = Phase::GameOver(w);
-            self.ball_v = v2(0.0, 0.0);
+            for ball in &mut self.balls {
+                ball.vel = v2(0.0, 0.0);
+            }
         } else {
             self.serve();
         }
     }
 
-    /// Avanza la simulazione di `dt` secondi.
     pub fn step(&mut self, dt: f32) {
         match self.phase {
             Phase::Countdown(t) => {
@@ -368,67 +476,105 @@ impl GameState {
                 }
             }
             Phase::Playing => {
-                self.advance_ball(dt);
+                self.play_time += dt;
+                self.advance_balls(dt);
                 self.tick_weapons(dt);
                 self.advance_bullets(dt);
+                self.tick_items(dt);
             }
             Phase::GameOver(_) => {}
         }
     }
 
-    fn advance_ball(&mut self, dt: f32) {
-        let dist = self.ball_v.len() * dt;
-        let steps = ((dist / 1.0).ceil() as i32).max(1);
-        let sub = dt / steps as f32;
-        for _ in 0..steps {
-            self.ball_p = self.ball_p + self.ball_v * sub;
-            // Risolvi le compenetrazioni (più passate per gli spigoli).
-            for _iter in 0..4 {
-                let mut worst: Option<(usize, f32, f32)> = None;
-                for (i, w) in self.arena.walls.iter().enumerate() {
-                    let s = (self.ball_p - w.a).dot(w.n);
-                    if s < BALL_R {
-                        let t = project_t(self.ball_p, w.a, w.b).clamp(0.0, 1.0);
-                        let replace = match worst {
-                            Some((_, bs, _)) => s < bs,
-                            None => true,
-                        };
-                        if replace {
-                            worst = Some((i, s, t));
+    fn advance_balls(&mut self, dt: f32) {
+        let count = self.balls.len();
+        let mut scored: Option<usize> = None;
+
+        'outer: for bi in 0..count {
+            // Palla trattenuta: segue la racchetta del giocatore.
+            if let Some(holder) = self.balls[bi].captured_by {
+                if self.players[holder].alive {
+                    let wi = self.arena.player_wall[holder];
+                    let w = self.arena.walls[wi];
+                    let c = self.players[holder].c;
+                    self.balls[bi].pos = w.point(c) + w.n * (BALL_R + EPS);
+                }
+                continue;
+            }
+
+            let speed = self.balls[bi].vel.len();
+            let steps = ((speed * dt / 1.0).ceil() as i32).max(1);
+            let sub = dt / steps as f32;
+
+            'steps: for _ in 0..steps {
+                self.balls[bi].pos = self.balls[bi].pos + self.balls[bi].vel * sub;
+
+                for _iter in 0..4 {
+                    let mut worst: Option<(usize, f32, f32)> = None;
+                    for wi in 0..self.arena.walls.len() {
+                        let w = self.arena.walls[wi];
+                        let s = (self.balls[bi].pos - w.a).dot(w.n);
+                        if s < BALL_R {
+                            let t = project_t(self.balls[bi].pos, w.a, w.b).clamp(0.0, 1.0);
+                            let replace = match worst {
+                                Some((_, bs, _)) => s < bs,
+                                None => true,
+                            };
+                            if replace {
+                                worst = Some((wi, s, t));
+                            }
                         }
                     }
-                }
-                let (wi, s, t) = match worst {
-                    Some(x) => x,
-                    None => break,
-                };
-                let w = self.arena.walls[wi];
-                match w.owner {
-                    None => {
-                        // Muro solido: riflessione speculare.
-                        let vn = self.ball_v.dot(w.n);
-                        self.ball_v = self.ball_v - w.n * (2.0 * vn);
-                        self.ball_p = self.ball_p + w.n * (BALL_R - s + EPS);
-                    }
-                    Some(pid) => {
-                        let pc = self.players[pid].c;
-                        if (t - pc).abs() <= PADDLE_FRAC {
-                            // Colpo di racchetta: l'angolo dipende dal punto
-                            // d'impatto (stile arcade), sempre verso l'interno.
-                            let off = ((t - pc) / PADDLE_FRAC).clamp(-1.0, 1.0);
-                            let dir = w.n.rot(off * MAX_BOUNCE);
-                            let speed =
-                                (self.ball_v.len() * SPEEDUP).min(MAX_SPEED).max(BASE_SPEED);
-                            self.ball_v = dir * speed;
-                            self.ball_p = self.ball_p + w.n * (BALL_R - s + EPS);
-                            self.last_hitter = Some(pid);
-                        } else {
-                            self.concede(pid);
-                            return;
+                    let (wall_i, s, t) = match worst {
+                        Some(x) => x,
+                        None => break,
+                    };
+                    let w = self.arena.walls[wall_i];
+                    match w.owner {
+                        None => {
+                            let vn = self.balls[bi].vel.dot(w.n);
+                            self.balls[bi].vel = self.balls[bi].vel - w.n * (2.0 * vn);
+                            self.balls[bi].pos =
+                                self.balls[bi].pos + w.n * (BALL_R - s + EPS);
+                        }
+                        Some(pid) => {
+                            let pc = self.players[pid].c;
+                            if (t - pc).abs() <= PADDLE_FRAC {
+                                // Capture item attivo: trattieni la palla.
+                                if self.weapons[pid].capture_ready {
+                                    self.weapons[pid].capture_ready = false;
+                                    self.balls[bi].captured_by = Some(pid);
+                                    self.balls[bi].vel = v2(0.0, 0.0);
+                                    self.balls[bi].pos =
+                                        self.balls[bi].pos + w.n * (BALL_R - s + EPS);
+                                    break;
+                                }
+                                // Riflessione normale con speedup e ramp.
+                                let off = ((t - pc) / PADDLE_FRAC).clamp(-1.0, 1.0);
+                                let dir = w.n.rot(off * MAX_BOUNCE);
+                                let min_speed = self.current_min_speed();
+                                let new_speed = (self.balls[bi].vel.len() * SPEEDUP)
+                                    .min(MAX_SPEED)
+                                    .max(min_speed);
+                                self.balls[bi].vel = dir * new_speed;
+                                self.balls[bi].pos =
+                                    self.balls[bi].pos + w.n * (BALL_R - s + EPS);
+                                self.last_hitter = Some(pid);
+                            } else {
+                                scored = Some(pid);
+                                break 'steps;
+                            }
                         }
                     }
                 }
             }
+            if scored.is_some() {
+                break 'outer;
+            }
+        }
+
+        if let Some(pid) = scored {
+            self.concede(pid);
         }
     }
 
@@ -457,14 +603,10 @@ impl GameState {
 
         for (bi, bullet) in self.bullets.iter_mut().enumerate() {
             bullet.pos = bullet.pos + bullet.vel * dt;
-
-            // Fuori dall'arena: rimuovi.
             if bullet.pos.len() > R * 3.5 {
                 to_remove.push(bi);
                 continue;
             }
-
-            // Controlla collisioni con i muri.
             for w in &self.arena.walls {
                 let s = (bullet.pos - w.a).dot(w.n);
                 if s < BULLET_R {
@@ -480,12 +622,88 @@ impl GameState {
         }
 
         for pid in slow_targets {
-            self.weapons[pid].slow_level = (self.weapons[pid].slow_level + SLOW_PER_HIT).min(1.0);
+            self.weapons[pid].slow_level =
+                (self.weapons[pid].slow_level + SLOW_PER_HIT).min(1.0);
         }
         to_remove.sort_unstable();
         to_remove.dedup();
         for bi in to_remove.into_iter().rev() {
             self.bullets.remove(bi);
+        }
+    }
+
+    fn tick_items(&mut self, dt: f32) {
+        if !self.items_enabled {
+            return;
+        }
+        // Spawn timer.
+        self.item_spawn_timer -= dt;
+        if self.item_spawn_timer <= 0.0 && self.items.len() < ITEM_MAX {
+            let angle = rand_unit(&mut self.rng) * std::f32::consts::TAU;
+            let dist = rand_unit(&mut self.rng).sqrt() * R * 0.4;
+            let pos = v2(angle.cos() * dist, angle.sin() * dist);
+            let k = xorshift(&mut self.rng) % 3;
+            let kind = match k {
+                0 => ItemKind::Multiball,
+                1 => ItemKind::Paralysis,
+                _ => ItemKind::Capture,
+            };
+            self.items.push(Item { pos, kind });
+            self.item_spawn_timer = ITEM_INTERVAL;
+        }
+
+        // Collisione palla-item.
+        let mut hits: Vec<(usize, usize)> = Vec::new(); // (item_idx, ball_idx)
+        for ii in 0..self.items.len() {
+            let item_pos = self.items[ii].pos;
+            for bi in 0..self.balls.len() {
+                if self.balls[bi].captured_by.is_some() {
+                    continue;
+                }
+                if (self.balls[bi].pos - item_pos).len() < BALL_R + ITEM_R {
+                    hits.push((ii, bi));
+                    break;
+                }
+            }
+        }
+        // Ordina e de-duplica per item_idx, processa in reverse per indici stabili.
+        hits.sort_by_key(|&(ii, _)| ii);
+        hits.dedup_by_key(|&mut (ii, _)| ii);
+        for (ii, _bi) in hits.into_iter().rev() {
+            if ii >= self.items.len() {
+                continue;
+            }
+            let item = self.items.remove(ii);
+            let activator = self.last_hitter;
+            match item.kind {
+                ItemKind::Multiball => {
+                    let speed = self.current_min_speed();
+                    for _ in 0..4 {
+                        let a = rand_unit(&mut self.rng) * std::f32::consts::TAU;
+                        self.balls.push(Ball {
+                            pos: item.pos,
+                            vel: v2(a.cos(), a.sin()) * speed,
+                            captured_by: None,
+                        });
+                    }
+                }
+                ItemKind::Paralysis => {
+                    if let Some(pid) = activator {
+                        let n = self.players.len();
+                        for other in 0..n {
+                            if other != pid && self.players[other].alive {
+                                self.weapons[other].freeze_timer = PARALYSIS_DURATION
+                                    .max(self.weapons[other].freeze_timer);
+                            }
+                        }
+                    }
+                }
+                ItemKind::Capture => {
+                    if let Some(pid) = activator {
+                        self.weapons[pid].capture_ready = true;
+                    }
+                }
+            }
         }
     }
 
@@ -495,27 +713,33 @@ impl GameState {
             Phase::Playing => (1, 0.0, -1),
             Phase::GameOver(w) => (2, 0.0, w as i32),
         };
+        let balls: Vec<V2> = self.balls.iter().map(|b| b.pos).collect();
+        let weapons: Vec<(i32, f32, f32, i32, u8)> = self
+            .weapons
+            .iter()
+            .enumerate()
+            .map(|(pid, w)| {
+                let cap = if self.balls.iter().any(|b| b.captured_by == Some(pid)) {
+                    2u8
+                } else if w.capture_ready {
+                    1u8
+                } else {
+                    0u8
+                };
+                (w.ammo, w.slow_level, w.freeze_timer, w.grenades, cap)
+            })
+            .collect();
+        let items: Vec<(V2, u8)> = self.items.iter().map(|it| (it.pos, it.kind as u8)).collect();
         Snapshot {
             phase_code,
             countdown,
             winner,
             n: self.players.len(),
-            ball: self.ball_p,
-            players: self
-                .players
-                .iter()
-                .map(|p| (p.c, p.lives, p.alive))
-                .collect(),
-            weapons: self
-                .weapons
-                .iter()
-                .map(|w| (w.ammo, w.slow_level, w.freeze_timer, w.grenades))
-                .collect(),
-            bullets: self
-                .bullets
-                .iter()
-                .map(|b| (b.pos, b.shooter))
-                .collect(),
+            balls,
+            players: self.players.iter().map(|p| (p.c, p.lives, p.alive)).collect(),
+            weapons,
+            bullets: self.bullets.iter().map(|b| (b.pos, b.shooter)).collect(),
+            items,
         }
     }
 }
@@ -529,27 +753,38 @@ pub struct Snapshot {
     pub countdown: f32,
     pub winner: i32,
     pub n: usize,
-    pub ball: V2,
-    pub players: Vec<(f32, i32, bool)>,            // (c, vite, vivo)
-    pub weapons: Vec<(i32, f32, f32, i32)>,         // (ammo, slow, freeze, granate)
-    pub bullets: Vec<(V2, usize)>,                  // (pos, shooter)
+    pub balls: Vec<V2>,
+    pub players: Vec<(f32, i32, bool)>,
+    pub weapons: Vec<(i32, f32, f32, i32, u8)>, // (ammo, slow, freeze, grenades, capture_u8)
+    pub bullets: Vec<(V2, usize)>,
+    pub items: Vec<(V2, u8)>,
 }
 
 impl Snapshot {
     pub fn encode(&self) -> String {
         let mut s = format!(
-            "S {} {:.3} {} {} {:.3} {:.3}",
-            self.phase_code, self.countdown, self.winner, self.n, self.ball.x, self.ball.y
+            "S {} {:.3} {} {} {}",
+            self.phase_code, self.countdown, self.winner, self.n, self.balls.len()
         );
+        for b in &self.balls {
+            s.push_str(&format!(" {:.3} {:.3}", b.x, b.y));
+        }
         for (c, lives, alive) in &self.players {
             s.push_str(&format!(" {:.4} {} {}", c, lives, if *alive { 1 } else { 0 }));
         }
-        for (ammo, slow, freeze, grenades) in &self.weapons {
-            s.push_str(&format!(" {} {:.2} {:.2} {}", ammo, slow, freeze, grenades));
+        for (ammo, slow, freeze, grenades, cap) in &self.weapons {
+            s.push_str(&format!(
+                " {} {:.2} {:.2} {} {}",
+                ammo, slow, freeze, grenades, cap
+            ));
         }
         s.push_str(&format!(" {}", self.bullets.len()));
         for (pos, shooter) in &self.bullets {
             s.push_str(&format!(" {:.2} {:.2} {}", pos.x, pos.y, shooter));
+        }
+        s.push_str(&format!(" {}", self.items.len()));
+        for (pos, kind) in &self.items {
+            s.push_str(&format!(" {:.2} {:.2} {}", pos.x, pos.y, kind));
         }
         s.push('\n');
         s
@@ -564,8 +799,13 @@ impl Snapshot {
         let countdown: f32 = it.next()?.parse().ok()?;
         let winner: i32 = it.next()?.parse().ok()?;
         let n: usize = it.next()?.parse().ok()?;
-        let bx: f32 = it.next()?.parse().ok()?;
-        let by: f32 = it.next()?.parse().ok()?;
+        let nb: usize = it.next()?.parse().ok()?;
+        let mut balls = Vec::with_capacity(nb);
+        for _ in 0..nb {
+            let bx: f32 = it.next()?.parse().ok()?;
+            let by: f32 = it.next()?.parse().ok()?;
+            balls.push(v2(bx, by));
+        }
         let mut players = Vec::with_capacity(n);
         for _ in 0..n {
             let c: f32 = it.next()?.parse().ok()?;
@@ -579,25 +819,35 @@ impl Snapshot {
             let slow: f32 = it.next()?.parse().ok()?;
             let freeze: f32 = it.next()?.parse().ok()?;
             let grenades: i32 = it.next()?.parse().ok()?;
-            weapons.push((ammo, slow, freeze, grenades));
+            let cap: u8 = it.next()?.parse().ok()?;
+            weapons.push((ammo, slow, freeze, grenades, cap));
         }
-        let nb: usize = it.next()?.parse().ok()?;
-        let mut bullets = Vec::with_capacity(nb);
-        for _ in 0..nb {
+        let nb_bullets: usize = it.next()?.parse().ok()?;
+        let mut bullets = Vec::with_capacity(nb_bullets);
+        for _ in 0..nb_bullets {
             let px: f32 = it.next()?.parse().ok()?;
             let py: f32 = it.next()?.parse().ok()?;
             let sid: usize = it.next()?.parse().ok()?;
             bullets.push((v2(px, py), sid));
+        }
+        let ni: usize = it.next()?.parse().ok()?;
+        let mut items = Vec::with_capacity(ni);
+        for _ in 0..ni {
+            let ix: f32 = it.next()?.parse().ok()?;
+            let iy: f32 = it.next()?.parse().ok()?;
+            let kind: u8 = it.next()?.parse().ok()?;
+            items.push((v2(ix, iy), kind));
         }
         Some(Snapshot {
             phase_code,
             countdown,
             winner,
             n,
-            ball: v2(bx, by),
+            balls,
             players,
             weapons,
             bullets,
+            items,
         })
     }
 }
@@ -607,11 +857,11 @@ impl Snapshot {
 // ---------------------------------------------------------------------------
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NetInput {
-    pub intent: i32, // +1 su/destra, -1 giù/sinistra, 0 fermo
+    pub intent: i32,
     pub restart: bool,
     pub quit: bool,
-    pub fire: bool,    // edge: spara col fucile
-    pub grenade: bool, // edge: usa granata
+    pub fire: bool,
+    pub grenade: bool,
 }
 
 impl NetInput {
@@ -658,7 +908,8 @@ mod tests {
         assert_eq!(s.players.len(), back.players.len());
         assert_eq!(s.weapons.len(), back.weapons.len());
         assert_eq!(s.bullets.len(), back.bullets.len());
-        assert!((s.ball.x - back.ball.x).abs() < 1e-2);
+        assert_eq!(s.balls.len(), back.balls.len());
+        assert!((s.balls[0].x - back.balls[0].x).abs() < 1e-2);
     }
 
     #[test]
@@ -685,21 +936,18 @@ mod tests {
         assert!(matches!(g.phase, Phase::Countdown(_)));
         g.step(COUNTDOWN + 0.1);
         assert!(matches!(g.phase, Phase::Playing));
-        assert!(g.ball_v.len() > 1.0);
+        assert!(g.balls[0].vel.len() > 1.0);
     }
 
     #[test]
     fn missing_paddle_costs_a_life() {
         let mut g = GameState::new(3, 99, LIVES_START);
         g.phase = Phase::Playing;
-        // sparo la palla dritta contro il lato del giocatore 0, lontano dalla
-        // racchetta (che tengo al centro), così deve subire un punto.
         let wi = g.arena.player_wall[0];
         let w = g.arena.walls[wi];
-        // punto vicino al vertice `a` del lato (parametro ~0), fuori racchetta
         let target = w.point(0.02);
-        g.ball_p = target - w.n * 1.0; // appena dentro
-        g.ball_v = w.n * (-BASE_SPEED); // verso l'esterno attraverso il lato
+        g.balls[0].pos = target - w.n * 1.0;
+        g.balls[0].vel = w.n * (-BASE_SPEED);
         let before = g.players[0].lives;
         for _ in 0..30 {
             g.step(1.0 / 60.0);
@@ -710,14 +958,11 @@ mod tests {
     #[test]
     fn elimination_closes_wall_and_can_win() {
         let mut g = GameState::new(3, 5, LIVES_START);
-        // svuoto le vite del giocatore 2
         g.players[2].lives = 1;
-        // forzo l'eliminazione concedendo
         g.concede(2);
         assert!(!g.players[2].alive);
         let wi = g.arena.player_wall[2];
         assert!(g.arena.walls[wi].owner.is_none(), "il lato deve diventare solido");
-        // restano 2 vivi → nessun vincitore ancora
         assert!(matches!(g.phase, Phase::Countdown(_) | Phase::Playing));
     }
 
@@ -737,7 +982,10 @@ mod tests {
         let mut frames = 0;
         loop {
             g.step(1.0 / 60.0);
-            assert!(g.ball_p.len() < R * 2.0, "palla fuggita: {:?}", g.ball_p);
+            assert!(
+                g.balls.iter().all(|b| b.pos.len() < R * 2.0),
+                "palla fuggita"
+            );
             if let Phase::GameOver(_) = g.phase {
                 break;
             }
@@ -788,8 +1036,6 @@ mod tests {
         g.phase = Phase::Playing;
         g.weapons[0].ammo = 0;
         g.weapons[0].reload_acc = 0.0;
-        // 1 munizione ogni 5 secondi (AMMO_RELOAD_RATE = 0.2); usiamo 6 s per
-        // evitare problemi di arrotondamento f32.
         for _ in 0..360 {
             g.tick_weapons(1.0 / 60.0);
         }
@@ -800,7 +1046,7 @@ mod tests {
     fn slow_effect_reduces_paddle_speed() {
         let mut g = GameState::new(2, 1, LIVES_START);
         g.phase = Phase::Playing;
-        g.weapons[0].slow_level = 1.0; // massimo rallentamento
+        g.weapons[0].slow_level = 1.0;
         let c_before = g.players[0].c;
         g.apply_input(0, 1, 1.0 / 60.0);
         let delta_slow = (g.players[0].c - c_before).abs();
@@ -821,5 +1067,52 @@ mod tests {
         let before = g.weapons[1].grenades;
         g.concede(0);
         assert!(g.weapons[1].grenades > before, "chi ha segnato doveva ricevere una granata");
+    }
+
+    #[test]
+    fn speed_ramps_up_over_play_time() {
+        let mut g = GameState::new(2, 1, LIVES_START);
+        let speed_at_start = g.current_min_speed();
+        g.play_time = 100.0; // 100 secondi simulati
+        let speed_later = g.current_min_speed();
+        assert!(speed_later > speed_at_start, "la velocità minima deve aumentare col tempo");
+        assert!(speed_later <= BASE_SPEED + SPEED_RAMP_MAX + 0.01, "non deve superare il cap");
+    }
+
+    #[test]
+    fn multiball_item_spawns_extra_balls() {
+        let mut g = GameState::new(2, 1, LIVES_START);
+        g.phase = Phase::Playing;
+        g.items_enabled = true;
+        g.last_hitter = Some(0);
+        // Piazza un item Multiball dove sta la palla.
+        let ball_pos = g.balls[0].pos;
+        g.items.push(Item { pos: ball_pos, kind: ItemKind::Multiball });
+        let before = g.balls.len();
+        g.tick_items(1.0 / 60.0);
+        assert!(g.balls.len() > before, "Multiball deve aggiungere palline");
+    }
+
+    #[test]
+    fn capture_item_lets_player_hold_ball() {
+        let mut g = GameState::new(2, 1, LIVES_START);
+        g.phase = Phase::Playing;
+        g.weapons[0].capture_ready = true;
+        // Manda la palla contro il lato del giocatore 0 esattamente sulla racchetta.
+        let wi = g.arena.player_wall[0];
+        let w = g.arena.walls[wi];
+        let paddle_c = g.players[0].c;
+        g.balls[0].pos = w.point(paddle_c) + w.n * (BALL_R + 0.5);
+        g.balls[0].vel = w.n * -BASE_SPEED;
+        for _ in 0..10 {
+            g.step(1.0 / 60.0);
+            if g.balls[0].captured_by.is_some() {
+                break;
+            }
+        }
+        assert!(
+            g.balls[0].captured_by == Some(0),
+            "la palla deve essere trattenuta dal giocatore 0"
+        );
     }
 }
