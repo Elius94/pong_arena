@@ -28,9 +28,7 @@ fn restore() {
 
 /// Guard RAII: predispone il terminale e lo ripristina in `drop`, anche in caso
 /// di panic (grazie all'hook installato).
-pub struct TerminalGuard {
-    pub release_supported: bool,
-}
+pub struct TerminalGuard;
 
 impl TerminalGuard {
     pub fn new() -> io::Result<Self> {
@@ -52,7 +50,7 @@ impl TerminalGuard {
             );
         }
         out.flush()?;
-        Ok(TerminalGuard { release_supported })
+        Ok(TerminalGuard)
     }
 }
 
