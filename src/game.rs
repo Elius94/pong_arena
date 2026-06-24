@@ -41,7 +41,7 @@ pub const PARALYSIS_DURATION: f32 = 3.0;
 
 // ---- Buco nero ------------------------------------------------------------
 pub const BLACK_HOLE_DURATION: f32 = 7.0;
-pub const BLACK_HOLE_G: f32 = 1500.0;  // forza gravitazionale (unità/s²)
+pub const BLACK_HOLE_G: f32 = 1700.0;  // forza gravitazionale (unità/s²)
 pub const BLACK_HOLE_VIS_R: f32 = 10.0; // raggio visuale per il rendering
 
 // ---- Regole ---------------------------------------------------------------
@@ -152,6 +152,7 @@ pub struct GameState {
     pub item_spawn_timer: f32,
     pub black_hole_timer: f32,
     pub play_time: f32,
+    pub kills: Vec<i32>, // punti segnati da ciascun giocatore (vita sottratta come last_hitter)
     last_hitter: Option<usize>,
     rng: u64,
     pub start_lives: i32,
@@ -185,6 +186,7 @@ impl GameState {
             item_spawn_timer: 0.0,
             black_hole_timer: 0.0,
             play_time: 0.0,
+            kills: vec![0; n],
             last_hitter: None,
             rng: seed | 1,
             start_lives: lives,
@@ -273,6 +275,9 @@ impl GameState {
         self.item_spawn_timer = 0.0;
         self.black_hole_timer = 0.0;
         self.play_time = 0.0;
+        for k in self.kills.iter_mut() {
+            *k = 0;
+        }
         self.last_hitter = None;
         self.serve();
         if let Some(w) = self.sole_survivor() {
@@ -395,6 +400,9 @@ impl GameState {
         if !self.players[pid].alive {
             return;
         }
+        if self.weapons[pid].freeze_timer > 0.0 {
+            return;
+        }
         let wi = self.arena.player_wall[pid];
         let w = self.arena.walls[wi];
         let mut best: Option<(f32, f32)> = None; // (projected_t, dist_to_wall)
@@ -457,6 +465,9 @@ impl GameState {
             if scorer != pid && self.players[scorer].alive {
                 self.weapons[scorer].grenades =
                     (self.weapons[scorer].grenades + 1).min(GRENADES_MAX);
+                if scorer < self.kills.len() {
+                    self.kills[scorer] += 1;
+                }
             }
         }
         if self.players[pid].lives > 0 {

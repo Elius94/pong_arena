@@ -3,6 +3,7 @@
 use crate::game::*;
 use crate::net::*;
 use crate::render::{self, Frame};
+use crate::scores;
 use crate::terminal::{poll_key, InputState, Key, TerminalGuard};
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -341,6 +342,7 @@ pub fn run_host(port: u16, bots: usize, host_name: String, lives: i32) -> std::i
     let mut input = InputState::new();
     let mut last = Instant::now();
     let mut last_size = term_size();
+    let mut score_saved = false;
     clear_trail();
 
     let title = format!("{} · {} giocatori · porta {}", all_names[0], n, port);
@@ -378,6 +380,7 @@ pub fn run_host(port: u16, bots: usize, host_name: String, lives: i32) -> std::i
         }
         if matches!(game.phase, Phase::GameOver(_)) && want_restart {
             game.restart();
+            score_saved = false;
             clear_trail();
         }
         input.restart = false;
@@ -399,6 +402,18 @@ pub fn run_host(port: u16, bots: usize, host_name: String, lives: i32) -> std::i
         }
 
         game.step(dt);
+
+        // Salva la classifica al primo frame di GameOver.
+        if !score_saved {
+            if let Phase::GameOver(winner) = game.phase {
+                let winner_name = all_names
+                    .get(winner)
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
+                scores::update(winner_name, &all_names, &game.kills);
+                score_saved = true;
+            }
+        }
 
         // Snapshot a tutti i client.
         let snap = game.snapshot();

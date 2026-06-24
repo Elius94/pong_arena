@@ -17,6 +17,7 @@ mod geom;
 mod menu;
 mod net;
 mod render;
+mod scores;
 mod terminal;
 
 use std::io::{self, Write};
@@ -31,7 +32,8 @@ fn usage() -> ! {
          USO:\n  \
            pong_arena                              menu interattivo\n  \
            pong_arena host [--port N] [--bots K] [--lives V] [--nickname NAME]\n  \
-           pong_arena join <ip> [--port N] [--nickname NAME]\n\
+           pong_arena join <ip> [--port N] [--nickname NAME]\n  \
+           pong_arena leaderboard                  mostra la classifica salvata\n\
          \n\
          OPZIONI:\n  \
            --port N          porta TCP (default {DEFAULT_PORT})\n  \
@@ -42,12 +44,14 @@ fn usage() -> ! {
          \n\
          COMANDI DI GIOCO:\n  \
            ←/→ · A/D · W/S  muovi la racchetta lungo il tuo lato\n  \
+           SPACE            spara   G  granata\n  \
            R                rivincita (a fine partita)   Q  esci\n\
          \n\
          ESEMPI:\n  \
            pong_arena host                 duello: aspetta 1 avversario\n  \
            pong_arena host --bots 3        arena a 4 lati tu + 3 bot\n  \
-           pong_arena join 192.168.1.20    unisciti all'host"
+           pong_arena join 192.168.1.20    unisciti all'host\n  \
+           pong_arena leaderboard          classifica globale"
     );
     std::process::exit(2);
 }
@@ -187,6 +191,9 @@ fn main() {
                 eprintln!("Errore guest: {e}");
                 std::process::exit(1);
             }
+        }
+        "leaderboard" | "classifica" | "scores" => {
+            scores::print_leaderboard();
         }
         _ => usage(),
     }
