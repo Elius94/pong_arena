@@ -52,14 +52,27 @@ fn compose(snap: &Snapshot, my_id: usize, title_right: &str, names: &[String]) -
         }
     }
 
-    let mut out = String::from("\x1b[2J");
+    // Sovrascrive le righe fuori dall'area di gioco (chrome) con spazi a larghezza
+    // piena anziché usare \x1b[2K. Su Windows ConHost le sequenze "erase" causano
+    // un riempimento del buffer che viene renderizzato come flash visibile, mentre
+    // la scrittura di caratteri (spazi) viene raggruppata nel singolo flush() e
+    // non produce flash.
+    let rows_n = rows as usize;
+    let blank_row = format!("\x1b[0m{}", " ".repeat(cols as usize));
+    let mut out = String::new();
+    for r in 0..or_ {
+        out.push_str(&format!("\x1b[{};1H{}", r + 1, blank_row));
+    }
+    for r in (or_ + ch)..rows_n {
+        out.push_str(&format!("\x1b[{};1H{}", r + 1, blank_row));
+    }
     let mut frame = Frame::new(cw, ch);
     let trail = TRAIL.with(|t| t.borrow().clone());
     render::draw_arena(&mut frame, snap, my_id, &trail);
     out.push_str(&render::blit(&frame, oc, or_));
     out.push_str(&render::chrome(
         cols as usize,
-        rows as usize,
+        rows_n,
         title_right,
         Some(snap),
         my_id,
@@ -69,7 +82,7 @@ fn compose(snap: &Snapshot, my_id: usize, title_right: &str, names: &[String]) -
     if snap.phase_code == 2 {
         out.push_str(&render::game_over_overlay(
             cols as usize,
-            rows as usize,
+            rows_n,
             snap.winner.max(0) as usize,
             my_id,
             names,
@@ -78,7 +91,7 @@ fn compose(snap: &Snapshot, my_id: usize, title_right: &str, names: &[String]) -
     // Overlay granata: mostrato solo al giocatore congelato da una granata avversaria.
     if let Some(&(_, _, freeze_t, _, cap)) = snap.weapons.get(my_id) {
         if freeze_t > 0.0 && cap & 0x04 != 0 {
-            out.push_str(&render::grenade_overlay(cols as usize, rows as usize, freeze_t));
+            out.push_str(&render::grenade_overlay(cols as usize, rows_n, freeze_t));
         }
     }
     out
