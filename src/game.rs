@@ -39,6 +39,11 @@ pub const ITEM_INTERVAL: f32 = 15.0;   // secondi tra spawn
 pub const ITEM_MAX: usize = 3;
 pub const PARALYSIS_DURATION: f32 = 3.0;
 
+// ---- Buco nero ------------------------------------------------------------
+pub const BLACK_HOLE_DURATION: f32 = 7.0;
+pub const BLACK_HOLE_G: f32 = 1500.0;  // forza gravitazionale (unità/s²)
+pub const BLACK_HOLE_VIS_R: f32 = 10.0; // raggio visuale per il rendering
+
 // ---- Regole ---------------------------------------------------------------
 pub const COUNTDOWN: f32 = 1.6;
 #[allow(dead_code)]
@@ -68,6 +73,7 @@ pub struct WeaponState {
     pub slow_level: f32,
     pub last_intent: i32,
     pub freeze_timer: f32,
+    pub grenade_frozen: bool, // true se il freeze attuale viene da una granata avversaria
     pub grenades: i32,
     pub capture_ready: bool, // item Capture raccolto, aspetta la prossima pallina
 }
@@ -80,6 +86,7 @@ impl WeaponState {
             slow_level: 0.0,
             last_intent: 0,
             freeze_timer: 0.0,
+            grenade_frozen: false,
             grenades: 0,
             capture_ready: false,
         }
@@ -103,9 +110,10 @@ pub struct Bullet {
 /// Tipo di item box.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ItemKind {
-    Multiball = 0,
-    Paralysis = 1,
-    Capture   = 2,
+    Multiball  = 0,
+    Paralysis  = 1,
+    Capture    = 2,
+    BlackHole  = 3,
 }
 
 pub struct Item {
@@ -142,6 +150,7 @@ pub struct GameState {
     pub items: Vec<Item>,
     pub items_enabled: bool,
     pub item_spawn_timer: f32,
+    pub black_hole_timer: f32,
     pub play_time: f32,
     last_hitter: Option<usize>,
     rng: u64,
@@ -174,6 +183,7 @@ impl GameState {
             items: Vec::new(),
             items_enabled: false,
             item_spawn_timer: 0.0,
+            black_hole_timer: 0.0,
             play_time: 0.0,
             last_hitter: None,
             rng: seed | 1,
@@ -261,6 +271,7 @@ impl GameState {
         self.items.clear();
         self.items_enabled = false;
         self.item_spawn_timer = 0.0;
+        self.black_hole_timer = 0.0;
         self.play_time = 0.0;
         self.last_hitter = None;
         self.serve();
@@ -329,6 +340,7 @@ impl GameState {
             for other in 0..self.players.len() {
                 if other != pid && self.players[other].alive {
                     self.weapons[other].freeze_timer = FREEZE_DURATION;
+                    self.weapons[other].grenade_frozen = true;
                 }
             }
         }
@@ -338,6 +350,9 @@ impl GameState {
     /// Va chiamato ogni frame, separatamente da `bot_step`.
     pub fn bot_action(&mut self, pid: usize) {
         if !self.players[pid].alive || !matches!(self.phase, Phase::Playing) {
+            return;
+        }
+        if self.weapons[pid].freeze_timer > 0.0 {
             return;
         }
         // Se trattiene una palla catturata, rilasciala subito mirando verso l'avversario più vicino.
@@ -481,6 +496,9 @@ impl GameState {
                 self.tick_weapons(dt);
                 self.advance_bullets(dt);
                 self.tick_items(dt);
+                if self.black_hole_timer > 0.0 {
+                    self.black_hole_timer = (self.black_hole_timer - dt).max(0.0);
+                }
             }
             Phase::GameOver(_) => {}
         }
@@ -507,6 +525,19 @@ impl GameState {
             let sub = dt / steps as f32;
 
             'steps: for _ in 0..steps {
+                // Attrazione gravitazionale del buco nero (prima dell'aggiornamento posizione).
+                if self.black_hole_timer > 0.0 {
+                    let to_center = v2(0.0, 0.0) - self.balls[bi].pos;
+                    let dist = to_center.len().max(8.0);
+                    self.balls[bi].vel = self.balls[bi].vel
+                        + to_center.norm() * (BLACK_HOLE_G / dist) * sub;
+                    // Limita la velocità per evitare valori estremi vicino alla singolarità.
+                    let spd = self.balls[bi].vel.len();
+                    if spd > MAX_SPEED * 2.0 {
+                        self.balls[bi].vel = self.balls[bi].vel * (MAX_SPEED * 2.0 / spd);
+                    }
+                }
+
                 self.balls[bi].pos = self.balls[bi].pos + self.balls[bi].vel * sub;
 
                 for _iter in 0..4 {
@@ -585,6 +616,9 @@ impl GameState {
             }
             if w.freeze_timer > 0.0 {
                 w.freeze_timer = (w.freeze_timer - dt).max(0.0);
+                if w.freeze_timer == 0.0 {
+                    w.grenade_frozen = false;
+                }
             }
             if w.ammo < AMMO_MAX {
                 w.reload_acc += dt * AMMO_RELOAD_RATE;
@@ -636,23 +670,9 @@ impl GameState {
         if !self.items_enabled {
             return;
         }
-        // Spawn timer.
-        self.item_spawn_timer -= dt;
-        if self.item_spawn_timer <= 0.0 && self.items.len() < ITEM_MAX {
-            let angle = rand_unit(&mut self.rng) * std::f32::consts::TAU;
-            let dist = rand_unit(&mut self.rng).sqrt() * R * 0.4;
-            let pos = v2(angle.cos() * dist, angle.sin() * dist);
-            let k = xorshift(&mut self.rng) % 3;
-            let kind = match k {
-                0 => ItemKind::Multiball,
-                1 => ItemKind::Paralysis,
-                _ => ItemKind::Capture,
-            };
-            self.items.push(Item { pos, kind });
-            self.item_spawn_timer = ITEM_INTERVAL;
-        }
 
-        // Collisione palla-item.
+        // Collisione palla-item: avviene PRIMA dello spawn così un item appena
+        // comparso non viene raccolto nello stesso frame in cui appare.
         let mut hits: Vec<(usize, usize)> = Vec::new(); // (item_idx, ball_idx)
         for ii in 0..self.items.len() {
             let item_pos = self.items[ii].pos;
@@ -703,6 +723,35 @@ impl GameState {
                         self.weapons[pid].capture_ready = true;
                     }
                 }
+                ItemKind::BlackHole => {
+                    // Attiva il buco nero al centro del campo per BLACK_HOLE_DURATION secondi.
+                    self.black_hole_timer =
+                        BLACK_HOLE_DURATION.max(self.black_hole_timer);
+                }
+            }
+        }
+
+        // Spawn timer: aggiornato DOPO la collision così il nuovo item non può
+        // essere raccolto nello stesso frame. Se ITEM_MAX è pieno il timer viene
+        // resettato a 0 (non scende sotto) per non far spawnare item
+        // immediatamente alla prima raccolta.
+        self.item_spawn_timer -= dt;
+        if self.item_spawn_timer <= 0.0 {
+            if self.items.len() < ITEM_MAX {
+                let angle = rand_unit(&mut self.rng) * std::f32::consts::TAU;
+                let dist = rand_unit(&mut self.rng).sqrt() * R * 0.4;
+                let pos = v2(angle.cos() * dist, angle.sin() * dist);
+                let k = xorshift(&mut self.rng) % 4;
+                let kind = match k {
+                    0 => ItemKind::Multiball,
+                    1 => ItemKind::Paralysis,
+                    2 => ItemKind::Capture,
+                    _ => ItemKind::BlackHole,
+                };
+                self.items.push(Item { pos, kind });
+                self.item_spawn_timer = ITEM_INTERVAL;
+            } else {
+                self.item_spawn_timer = 0.0;
             }
         }
     }
@@ -719,13 +768,11 @@ impl GameState {
             .iter()
             .enumerate()
             .map(|(pid, w)| {
-                let cap = if self.balls.iter().any(|b| b.captured_by == Some(pid)) {
-                    2u8
-                } else if w.capture_ready {
-                    1u8
-                } else {
-                    0u8
-                };
+                // bit 0: capture_ready, bit 1: holding ball, bit 2: grenade_frozen
+                let holding = self.balls.iter().any(|b| b.captured_by == Some(pid));
+                let cap = (w.capture_ready as u8)
+                    | ((holding as u8) << 1)
+                    | ((w.grenade_frozen as u8) << 2);
                 (w.ammo, w.slow_level, w.freeze_timer, w.grenades, cap)
             })
             .collect();
@@ -740,6 +787,7 @@ impl GameState {
             weapons,
             bullets: self.bullets.iter().map(|b| (b.pos, b.shooter)).collect(),
             items,
+            black_hole_timer: self.black_hole_timer,
         }
     }
 }
@@ -755,9 +803,10 @@ pub struct Snapshot {
     pub n: usize,
     pub balls: Vec<V2>,
     pub players: Vec<(f32, i32, bool)>,
-    pub weapons: Vec<(i32, f32, f32, i32, u8)>, // (ammo, slow, freeze, grenades, capture_u8)
+    pub weapons: Vec<(i32, f32, f32, i32, u8)>, // (ammo, slow, freeze, grenades, cap_flags)
     pub bullets: Vec<(V2, usize)>,
     pub items: Vec<(V2, u8)>,
+    pub black_hole_timer: f32,
 }
 
 impl Snapshot {
@@ -786,6 +835,7 @@ impl Snapshot {
         for (pos, kind) in &self.items {
             s.push_str(&format!(" {:.2} {:.2} {}", pos.x, pos.y, kind));
         }
+        s.push_str(&format!(" {:.2}", self.black_hole_timer));
         s.push('\n');
         s
     }
@@ -838,6 +888,7 @@ impl Snapshot {
             let kind: u8 = it.next()?.parse().ok()?;
             items.push((v2(ix, iy), kind));
         }
+        let black_hole_timer: f32 = it.next()?.parse().ok()?;
         Some(Snapshot {
             phase_code,
             countdown,
@@ -848,6 +899,7 @@ impl Snapshot {
             weapons,
             bullets,
             items,
+            black_hole_timer,
         })
     }
 }

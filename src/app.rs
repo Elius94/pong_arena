@@ -75,6 +75,12 @@ fn compose(snap: &Snapshot, my_id: usize, title_right: &str, names: &[String]) -
             names,
         ));
     }
+    // Overlay granata: mostrato solo al giocatore congelato da una granata avversaria.
+    if let Some(&(_, _, freeze_t, _, cap)) = snap.weapons.get(my_id) {
+        if freeze_t > 0.0 && cap & 0x04 != 0 {
+            out.push_str(&render::grenade_overlay(cols as usize, rows as usize, freeze_t));
+        }
+    }
     out
 }
 
@@ -188,6 +194,9 @@ pub fn run_host(port: u16, bots: usize, host_name: String, lives: i32) -> std::i
             match listener.accept() {
                 Ok((s, _addr)) => {
                     let _ = s.set_nodelay(true);
+                    // Su Windows i socket accettati ereditano il flag non-blocking
+                    // del listener: forziamo esplicitamente la modalità blocking.
+                    let _ = s.set_nonblocking(false);
                     // Timeout brevissimo sui read per la lobby: non usiamo
                     // non-blocking perché su Windows può impedire i write
                     // successivi (i write devono restare blocking).

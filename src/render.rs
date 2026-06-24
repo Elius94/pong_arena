@@ -275,6 +275,30 @@ pub fn draw_arena(f: &mut Frame, snap: &Snapshot, my_id: usize, trail: &VecDeque
         f.disc(ix, iy, (r * 0.35).max(1.5), (255, 255, 255));
     }
 
+    // Buco nero al centro dell'arena.
+    if snap.black_hole_timer > 0.0 {
+        use std::time::SystemTime;
+        let ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as f32;
+        // Pulsazione lenta (~1 Hz) + pulsazione rapida per l'alone esterno.
+        let pulse_slow = (ms * 0.006).sin();          // -1..1
+        let pulse_fast = (ms * 0.022).sin() * 0.5 + 0.5; // 0..1
+
+        let (cx, cy) = view.px(v2(0.0, 0.0));
+        let base = BLACK_HOLE_VIS_R * view.scale;
+
+        // Alone esterno viola scuro (respira lentamente).
+        f.disc(cx, cy, base * (1.5 + 0.18 * pulse_slow), (30, 0, 45));
+        // Bordo luminoso (event horizon) che pulsa veloce.
+        f.disc(cx, cy, base * (1.1 + 0.12 * pulse_fast), (160, 40, 210));
+        // Nucleo quasi nero.
+        f.disc(cx, cy, base * 0.72, (6, 0, 10));
+        // Singolarità: puntino bianco-violaceo che batte.
+        f.disc(cx, cy, base * (0.15 + 0.08 * pulse_fast), (230, 190, 255));
+    }
+
     // Scia + palline (nascoste a fine partita).
     if snap.phase_code != 2 {
         let n_tr = trail.len();
@@ -304,7 +328,8 @@ fn item_color(kind: u8) -> Rgb {
     match kind {
         0 => (255, 210, 50),  // Multiball: oro
         1 => (180, 100, 255), // Paralysis: viola
-        _ => (50, 220, 220),  // Capture: acqua
+        2 => (50, 220, 220),  // Capture: acqua
+        _ => (90, 0, 120),    // BlackHole: viola scuro
     }
 }
 
@@ -419,10 +444,12 @@ pub fn chrome(
                 } else {
                     String::new()
                 };
-                let cap_part = match cap {
-                    1 => "  ◎",  // capture_ready: aspetta pallina
-                    2 => "  ◉",  // palla trattenuta
-                    _ => "",
+                let cap_part = if cap & 0x02 != 0 {
+                    "  ◉"  // palla trattenuta (bit 1)
+                } else if cap & 0x01 != 0 {
+                    "  ◎"  // capture_ready (bit 0)
+                } else {
+                    ""
                 };
                 format!("{} vite  {}{}{}", lives.max(0), bar, grenade_part, cap_part)
             } else {
@@ -504,6 +531,38 @@ pub fn layout(cols: u16, rows: u16, target: f32) -> Option<(usize, usize, usize,
     let origin_col = (cols - cells_w) / 2;
     let origin_row = 1 + (avail_rows - cells_h) / 2;
     Some((cells_w, cells_h, origin_col, origin_row))
+}
+
+/// Overlay lampeggiante mostrato al giocatore che è stato congelato da una granata.
+/// Disegna due barre rosse (sopra/sotto l'area di gioco) e il testo "GRANATA"
+/// centrato; lampeggia a ~2 Hz usando l'orologio di sistema.
+pub fn grenade_overlay(cols: usize, rows: usize, freeze_t: f32) -> String {
+    use std::time::SystemTime;
+    let ms = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_millis();
+    if (ms / 350) % 2 != 0 {
+        return String::new();
+    }
+
+    let red: Rgb = (220, 55, 35);
+    let bright: Rgb = (255, 140, 110);
+    let mut out = String::new();
+
+    // Barra orizzontale piena sopra l'area di gioco (riga 2, sotto i nomi giocatori).
+    let bar: String = "▓".repeat(cols);
+    text_at(&mut out, 2, 0, red, &bar);
+    if rows > 5 {
+        text_at(&mut out, rows - 2, 0, red, &bar);
+    }
+
+    // Testo centrato con timer a scendere.
+    let secs = freeze_t.ceil().max(0.0) as u32;
+    let label = format!("⚡ GRANATA  {}s ⚡", secs);
+    centered(&mut out, rows / 2, cols, bright, &label);
+
+    out
 }
 
 pub fn flush(s: &str) -> io::Result<()> {
