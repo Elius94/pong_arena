@@ -10,11 +10,15 @@ use crate::geom::*;
 
 // ---- Palla ----------------------------------------------------------------
 pub const BALL_R: f32 = 2.0;
-pub const BASE_SPEED: f32 = 82.0;
-pub const MAX_SPEED: f32 = 180.0;
-pub const SPEEDUP: f32 = 1.045;
+pub const BASE_SPEED: f32 = 105.0;
+pub const MAX_SPEED: f32 = 260.0;
+pub const SPEEDUP: f32 = 1.055;
 pub const MAX_BOUNCE: f32 = 1.0472; // ±60°
 const EPS: f32 = 0.01;
+
+// ---- Anti-stallo ----------------------------------------------------------
+pub const STUCK_TIMEOUT: f32 = 10.0;  // secondi senza toccare un lato giocatore
+pub const STUCK_SPAWN: usize = 10;    // palline extra da spawnare allo scadere
 
 // ---- Progressione velocità ------------------------------------------------
 pub const SPEED_RAMP_RATE: f32 = 0.3;  // incremento minSpeed per secondo
@@ -32,6 +36,9 @@ pub const BULLET_DEFLECTION: f32 = 0.7;
 pub const FREEZE_DURATION: f32 = 2.0;
 pub const GRENADES_MAX: i32 = 2;
 pub const BOT_JITTER: f32 = 0.10;
+pub const SNIPER_AMMO: i32 = 5;    // proiettili letali per item raccolto
+pub const WOUND_KILLS_AT: i32 = 3; // colpi letali per eliminare
+pub const LETHAL_SPEED: f32 = 340.0;
 
 // ---- Item box -------------------------------------------------------------
 pub const ITEM_R: f32 = 5.0;
@@ -73,9 +80,11 @@ pub struct WeaponState {
     pub slow_level: f32,
     pub last_intent: i32,
     pub freeze_timer: f32,
-    pub grenade_frozen: bool, // true se il freeze attuale viene da una granata avversaria
+    pub grenade_frozen: bool,
     pub grenades: i32,
-    pub capture_ready: bool, // item Capture raccolto, aspetta la prossima pallina
+    pub capture_ready: bool,
+    pub sniper_ammo: i32,  // proiettili letali disponibili (da item Sniper)
+    pub wound_count: i32,  // colpi letali subìti (a WOUND_KILLS_AT → eliminazione)
 }
 
 impl WeaponState {
@@ -89,6 +98,8 @@ impl WeaponState {
             grenade_frozen: false,
             grenades: 0,
             capture_ready: false,
+            sniper_ammo: 0,
+            wound_count: 0,
         }
     }
 }
@@ -105,6 +116,7 @@ pub struct Bullet {
     pub pos: V2,
     pub vel: V2,
     pub shooter: usize,
+    pub lethal: bool, // true = proiettile Sniper; 3 colpi → eliminazione
 }
 
 /// Tipo di item box.
@@ -114,6 +126,7 @@ pub enum ItemKind {
     Paralysis  = 1,
     Capture    = 2,
     BlackHole  = 3,
+    Sniper     = 4, // proiettili letali: 3 colpi = eliminazione istantanea
 }
 
 pub struct Item {
@@ -152,7 +165,8 @@ pub struct GameState {
     pub item_spawn_timer: f32,
     pub black_hole_timer: f32,
     pub play_time: f32,
-    pub kills: Vec<i32>, // punti segnati da ciascun giocatore (vita sottratta come last_hitter)
+    pub kills: Vec<i32>,
+    pub stuck_timer: f32, // secondi senza che la palla tocchi un lato giocatore
     last_hitter: Option<usize>,
     rng: u64,
     pub start_lives: i32,
@@ -187,6 +201,7 @@ impl GameState {
             black_hole_timer: 0.0,
             play_time: 0.0,
             kills: vec![0; n],
+            stuck_timer: 0.0,
             last_hitter: None,
             rng: seed | 1,
             start_lives: lives,
@@ -275,6 +290,7 @@ impl GameState {
         self.item_spawn_timer = 0.0;
         self.black_hole_timer = 0.0;
         self.play_time = 0.0;
+        self.stuck_timer = 0.0;
         for k in self.kills.iter_mut() {
             *k = 0;
         }
@@ -323,21 +339,31 @@ impl GameState {
                 self.balls[bi].captured_by = None;
                 self.balls[bi].pos = w.point(self.players[pid].c) + w.n * (BALL_R * 2.0 + EPS);
                 self.last_hitter = Some(pid);
-            } else if self.weapons[pid].ammo > 0 {
-                self.weapons[pid].ammo -= 1;
-                let wi = self.arena.player_wall[pid];
-                let w = self.arena.walls[wi];
-                let c = self.players[pid].c;
-                let origin = w.point(c) + w.n * (BULLET_R + EPS);
-                let intent = self.weapons[pid].last_intent as f32;
-                let tangent = (w.b - w.a).norm();
-                let raw_dir =
-                    w.n + tangent * (intent * self.param_sign[pid] * BULLET_DEFLECTION);
-                self.bullets.push(Bullet {
-                    pos: origin,
-                    vel: raw_dir.norm() * BULLET_SPEED,
-                    shooter: pid,
-                });
+            } else {
+                let lethal = self.weapons[pid].sniper_ammo > 0;
+                let has_ammo = lethal || self.weapons[pid].ammo > 0;
+                if has_ammo {
+                    if lethal {
+                        self.weapons[pid].sniper_ammo -= 1;
+                    } else {
+                        self.weapons[pid].ammo -= 1;
+                    }
+                    let wi = self.arena.player_wall[pid];
+                    let w = self.arena.walls[wi];
+                    let c = self.players[pid].c;
+                    let origin = w.point(c) + w.n * (BULLET_R + EPS);
+                    let intent = self.weapons[pid].last_intent as f32;
+                    let tangent = (w.b - w.a).norm();
+                    let raw_dir =
+                        w.n + tangent * (intent * self.param_sign[pid] * BULLET_DEFLECTION);
+                    let speed = if lethal { LETHAL_SPEED } else { BULLET_SPEED };
+                    self.bullets.push(Bullet {
+                        pos: origin,
+                        vel: raw_dir.norm() * speed,
+                        shooter: pid,
+                        lethal,
+                    });
+                }
             }
         }
         if grenade && self.weapons[pid].grenades > 0 {
@@ -461,6 +487,7 @@ impl GameState {
     }
 
     fn concede(&mut self, pid: usize) {
+        self.stuck_timer = 0.0;
         if let Some(scorer) = self.last_hitter {
             if scorer != pid && self.players[scorer].alive {
                 self.weapons[scorer].grenades =
@@ -503,6 +530,19 @@ impl GameState {
             }
             Phase::Playing => {
                 self.play_time += dt;
+                self.stuck_timer += dt;
+                if self.stuck_timer >= STUCK_TIMEOUT {
+                    self.stuck_timer = 0.0;
+                    let speed = self.current_min_speed();
+                    for _ in 0..STUCK_SPAWN {
+                        let a = rand_unit(&mut self.rng) * std::f32::consts::TAU;
+                        self.balls.push(Ball {
+                            pos: v2(0.0, 0.0),
+                            vel: v2(a.cos(), a.sin()) * speed,
+                            captured_by: None,
+                        });
+                    }
+                }
                 self.advance_balls(dt);
                 self.tick_weapons(dt);
                 self.advance_bullets(dt);
@@ -602,6 +642,7 @@ impl GameState {
                                 self.balls[bi].pos =
                                     self.balls[bi].pos + w.n * (BALL_R - s + EPS);
                                 self.last_hitter = Some(pid);
+                                self.stuck_timer = 0.0;
                             } else {
                                 scored = Some(pid);
                                 break 'steps;
@@ -644,6 +685,7 @@ impl GameState {
 
     fn advance_bullets(&mut self, dt: f32) {
         let mut slow_targets: Vec<usize> = Vec::new();
+        let mut lethal_targets: Vec<usize> = Vec::new();
         let mut to_remove: Vec<usize> = Vec::new();
 
         for (bi, bullet) in self.bullets.iter_mut().enumerate() {
@@ -657,7 +699,11 @@ impl GameState {
                 if s < BULLET_R {
                     if let Some(owner) = w.owner {
                         if owner != bullet.shooter {
-                            slow_targets.push(owner);
+                            if bullet.lethal {
+                                lethal_targets.push(owner);
+                            } else {
+                                slow_targets.push(owner);
+                            }
                         }
                     }
                     to_remove.push(bi);
@@ -669,6 +715,24 @@ impl GameState {
         for pid in slow_targets {
             self.weapons[pid].slow_level =
                 (self.weapons[pid].slow_level + SLOW_PER_HIT).min(1.0);
+        }
+        let mut to_eliminate: Vec<usize> = Vec::new();
+        for pid in lethal_targets {
+            if self.players[pid].alive {
+                self.weapons[pid].wound_count += 1;
+                if self.weapons[pid].wound_count >= WOUND_KILLS_AT {
+                    to_eliminate.push(pid);
+                }
+            }
+        }
+        to_eliminate.sort_unstable();
+        to_eliminate.dedup();
+        for pid in to_eliminate {
+            self.players[pid].lives = 0;
+            self.eliminate(pid);
+            if let Some(w) = self.sole_survivor() {
+                self.phase = Phase::GameOver(w);
+            }
         }
         to_remove.sort_unstable();
         to_remove.dedup();
@@ -735,9 +799,14 @@ impl GameState {
                     }
                 }
                 ItemKind::BlackHole => {
-                    // Attiva il buco nero al centro del campo per BLACK_HOLE_DURATION secondi.
                     self.black_hole_timer =
                         BLACK_HOLE_DURATION.max(self.black_hole_timer);
+                }
+                ItemKind::Sniper => {
+                    if let Some(pid) = activator {
+                        self.weapons[pid].sniper_ammo =
+                            (self.weapons[pid].sniper_ammo + SNIPER_AMMO).min(SNIPER_AMMO * 2);
+                    }
                 }
             }
         }
@@ -752,12 +821,13 @@ impl GameState {
                 let angle = rand_unit(&mut self.rng) * std::f32::consts::TAU;
                 let dist = rand_unit(&mut self.rng).sqrt() * R * 0.4;
                 let pos = v2(angle.cos() * dist, angle.sin() * dist);
-                let k = xorshift(&mut self.rng) % 4;
+                let k = xorshift(&mut self.rng) % 5;
                 let kind = match k {
                     0 => ItemKind::Multiball,
                     1 => ItemKind::Paralysis,
                     2 => ItemKind::Capture,
-                    _ => ItemKind::BlackHole,
+                    3 => ItemKind::BlackHole,
+                    _ => ItemKind::Sniper,
                 };
                 self.items.push(Item { pos, kind });
                 self.item_spawn_timer = ITEM_INTERVAL;
@@ -774,7 +844,7 @@ impl GameState {
             Phase::GameOver(w) => (2, 0.0, w as i32),
         };
         let balls: Vec<V2> = self.balls.iter().map(|b| b.pos).collect();
-        let weapons: Vec<(i32, f32, f32, i32, u8)> = self
+        let weapons: Vec<(i32, f32, f32, i32, u8, i32, i32)> = self
             .weapons
             .iter()
             .enumerate()
@@ -784,7 +854,7 @@ impl GameState {
                 let cap = (w.capture_ready as u8)
                     | ((holding as u8) << 1)
                     | ((w.grenade_frozen as u8) << 2);
-                (w.ammo, w.slow_level, w.freeze_timer, w.grenades, cap)
+                (w.ammo, w.slow_level, w.freeze_timer, w.grenades, cap, w.sniper_ammo, w.wound_count)
             })
             .collect();
         let items: Vec<(V2, u8)> = self.items.iter().map(|it| (it.pos, it.kind as u8)).collect();
@@ -796,7 +866,7 @@ impl GameState {
             balls,
             players: self.players.iter().map(|p| (p.c, p.lives, p.alive)).collect(),
             weapons,
-            bullets: self.bullets.iter().map(|b| (b.pos, b.shooter)).collect(),
+            bullets: self.bullets.iter().map(|b| (b.pos, b.shooter, b.lethal)).collect(),
             items,
             black_hole_timer: self.black_hole_timer,
         }
@@ -814,8 +884,8 @@ pub struct Snapshot {
     pub n: usize,
     pub balls: Vec<V2>,
     pub players: Vec<(f32, i32, bool)>,
-    pub weapons: Vec<(i32, f32, f32, i32, u8)>, // (ammo, slow, freeze, grenades, cap_flags)
-    pub bullets: Vec<(V2, usize)>,
+    pub weapons: Vec<(i32, f32, f32, i32, u8, i32, i32)>, // (ammo,slow,freeze,grenades,cap,sniper_ammo,wound_count)
+    pub bullets: Vec<(V2, usize, bool)>, // (pos, shooter, lethal)
     pub items: Vec<(V2, u8)>,
     pub black_hole_timer: f32,
 }
@@ -832,15 +902,15 @@ impl Snapshot {
         for (c, lives, alive) in &self.players {
             s.push_str(&format!(" {:.4} {} {}", c, lives, if *alive { 1 } else { 0 }));
         }
-        for (ammo, slow, freeze, grenades, cap) in &self.weapons {
+        for (ammo, slow, freeze, grenades, cap, sniper, wounds) in &self.weapons {
             s.push_str(&format!(
-                " {} {:.2} {:.2} {} {}",
-                ammo, slow, freeze, grenades, cap
+                " {} {:.2} {:.2} {} {} {} {}",
+                ammo, slow, freeze, grenades, cap, sniper, wounds
             ));
         }
         s.push_str(&format!(" {}", self.bullets.len()));
-        for (pos, shooter) in &self.bullets {
-            s.push_str(&format!(" {:.2} {:.2} {}", pos.x, pos.y, shooter));
+        for (pos, shooter, lethal) in &self.bullets {
+            s.push_str(&format!(" {:.2} {:.2} {} {}", pos.x, pos.y, shooter, *lethal as u8));
         }
         s.push_str(&format!(" {}", self.items.len()));
         for (pos, kind) in &self.items {
@@ -881,7 +951,9 @@ impl Snapshot {
             let freeze: f32 = it.next()?.parse().ok()?;
             let grenades: i32 = it.next()?.parse().ok()?;
             let cap: u8 = it.next()?.parse().ok()?;
-            weapons.push((ammo, slow, freeze, grenades, cap));
+            let sniper: i32 = it.next()?.parse().ok()?;
+            let wounds: i32 = it.next()?.parse().ok()?;
+            weapons.push((ammo, slow, freeze, grenades, cap, sniper, wounds));
         }
         let nb_bullets: usize = it.next()?.parse().ok()?;
         let mut bullets = Vec::with_capacity(nb_bullets);
@@ -889,7 +961,8 @@ impl Snapshot {
             let px: f32 = it.next()?.parse().ok()?;
             let py: f32 = it.next()?.parse().ok()?;
             let sid: usize = it.next()?.parse().ok()?;
-            bullets.push((v2(px, py), sid));
+            let lethal: u8 = it.next()?.parse().ok()?;
+            bullets.push((v2(px, py), sid, lethal != 0));
         }
         let ni: usize = it.next()?.parse().ok()?;
         let mut items = Vec::with_capacity(ni);

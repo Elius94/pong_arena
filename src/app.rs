@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const FRAME: Duration = Duration::from_micros(16_667); // ~60 fps
 const TRAIL_LEN: usize = 12;
-const MAX_PLAYERS: usize = 20;
+const MAX_PLAYERS: usize = 40;
 
 fn seed() -> u64 {
     let n = SystemTime::now()
@@ -90,7 +90,7 @@ fn compose(snap: &Snapshot, my_id: usize, title_right: &str, names: &[String]) -
         ));
     }
     // Overlay granata: mostrato solo al giocatore congelato da una granata avversaria.
-    if let Some(&(_, _, freeze_t, _, cap)) = snap.weapons.get(my_id) {
+    if let Some(&(_, _, freeze_t, _, cap, _, _)) = snap.weapons.get(my_id) {
         if freeze_t > 0.0 && cap & 0x04 != 0 {
             out.push_str(&render::grenade_overlay(cols as usize, rows_n, freeze_t));
         }

@@ -22,9 +22,9 @@ const BALL: Rgb = (245, 246, 250);
 const COUNT_C: Rgb = (250, 214, 120);
 const LOCAL_HI: Rgb = (250, 252, 255);
 
-/// Colori distinti per i giocatori (fino a 20).
-const PLAYER_COLORS: [Rgb; 20] = [
-    (90, 224, 205),  // teal
+/// Colori distinti per i giocatori (fino a 40).
+const PLAYER_COLORS: [Rgb; 40] = [
+    (90,  224, 205), // teal
     (236, 120, 196), // rosa
     (250, 196, 100), // ambra
     (130, 178, 255), // azzurro
@@ -44,6 +44,26 @@ const PLAYER_COLORS: [Rgb; 20] = [
     (220, 140, 115), // terracotta
     (180, 115, 255), // lilla
     (255, 230, 120), // crema
+    (255,  80,  80), // rosso
+    (180, 255,  80), // lime
+    ( 80, 230, 255), // ciano
+    (255, 145,  60), // arancio
+    ( 60, 210, 150), // smeraldo
+    (255, 175, 175), // rosa antico
+    (100, 130, 255), // blu reale
+    (210, 240,  80), // chartreuse
+    (100, 255, 220), // acquamarina
+    (255, 200, 130), // albicocca
+    (120, 200, 255), // celeste
+    (255,  80, 200), // fucsia
+    (160, 200, 100), // oliva
+    (255, 210, 160), // panna
+    ( 80, 200, 200), // turchese
+    (200, 180, 255), // lavanda
+    (255, 240, 100), // giallo caldo
+    (100, 240, 120), // verde brillante
+    (255, 150, 140), // salmone
+    (150, 230, 255), // acqua chiara
 ];
 
 fn player_color(pid: usize) -> Rgb {
@@ -221,7 +241,7 @@ pub fn draw_arena(f: &mut Frame, snap: &Snapshot, my_id: usize, trail: &VecDeque
                     f.line(pa, pb, 0.8, WALL_DIM);
                     let base_col = player_color(pid);
                     let col = if pid < snap.weapons.len() {
-                        let (_, slow_t, freeze_t, _, _) = snap.weapons[pid];
+                        let (_, slow_t, freeze_t, _, _, _, _) = snap.weapons[pid];
                         if freeze_t > 0.0 {
                             mix(base_col, FREEZE_TINT, 0.75)
                         } else if slow_t > 0.0 {
@@ -254,10 +274,11 @@ pub fn draw_arena(f: &mut Frame, snap: &Snapshot, my_id: usize, trail: &VecDeque
     }
 
     // Proiettili.
-    for &(pos, shooter) in &snap.bullets {
+    for &(pos, shooter, lethal) in &snap.bullets {
         let (px, py) = view.px(pos);
-        let r = (BULLET_R * view.scale).max(2.0);
-        f.disc(px, py, r, player_color(shooter));
+        let r = (BULLET_R * view.scale * if lethal { 2.0 } else { 1.0 }).max(2.0);
+        let col = if lethal { (255, 60, 60) } else { player_color(shooter) };
+        f.disc(px, py, r, col);
     }
 
     // Item box.
@@ -329,7 +350,8 @@ fn item_color(kind: u8) -> Rgb {
         0 => (255, 210, 50),  // Multiball: oro
         1 => (180, 100, 255), // Paralysis: viola
         2 => (50, 220, 220),  // Capture: acqua
-        _ => (90, 0, 120),    // BlackHole: viola scuro
+        3 => (90, 0, 120),    // BlackHole: viola scuro
+        _ => (255, 60, 60),   // Sniper: rosso acceso
     }
 }
 
@@ -434,8 +456,8 @@ pub fn chrome(
         if my_id < sc.players.len() {
             let (_, lives, alive) = sc.players[my_id];
             let mine = if alive {
-                let (ammo, _, _, grenades, cap) =
-                    sc.weapons.get(my_id).copied().unwrap_or((AMMO_MAX, 0.0, 0.0, 0, 0));
+                let (ammo, _, _, grenades, cap, sniper, wounds) =
+                    sc.weapons.get(my_id).copied().unwrap_or((AMMO_MAX, 0.0, 0.0, 0, 0, 0, 0));
                 let bar: String = (0..AMMO_MAX as usize)
                     .map(|i| if i < ammo as usize { '█' } else { '░' })
                     .collect();
@@ -444,14 +466,24 @@ pub fn chrome(
                 } else {
                     String::new()
                 };
+                let sniper_part = if sniper > 0 {
+                    format!("  ⊕x{}", sniper)
+                } else {
+                    String::new()
+                };
+                let wound_part = if wounds > 0 {
+                    format!("  ☠{}/{}", wounds, WOUND_KILLS_AT)
+                } else {
+                    String::new()
+                };
                 let cap_part = if cap & 0x02 != 0 {
-                    "  ◉"  // palla trattenuta (bit 1)
+                    "  ◉"
                 } else if cap & 0x01 != 0 {
-                    "  ◎"  // capture_ready (bit 0)
+                    "  ◎"
                 } else {
                     ""
                 };
-                format!("{} vite  {}{}{}", lives.max(0), bar, grenade_part, cap_part)
+                format!("{} vite  {}{}{}{}{}", lives.max(0), bar, grenade_part, sniper_part, wound_part, cap_part)
             } else {
                 "eliminato".to_string()
             };

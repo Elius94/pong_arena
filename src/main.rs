@@ -171,8 +171,8 @@ fn main() {
                 }
                 i += 1;
             }
-            if bots > 19 {
-                bots = 19;
+            if bots > 39 {
+                bots = 39;
             }
             let name = nickname.unwrap_or_else(|| "Host".to_string());
             if let Err(e) = app::run_host(port, bots, name, lives) {
