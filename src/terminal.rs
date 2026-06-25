@@ -63,7 +63,9 @@ impl Drop for TerminalGuard {
 /// Stato dell'input locale.
 pub struct InputState {
     pub intent: i32,
-    pub quit: bool,
+    pub quit: bool,    // Ctrl+C: uscita immediata
+    pub pause: bool,   // ESC/Q: pausa o abbandona (edge, consumato dal chiamante)
+    pub confirm: bool, // Enter: conferma nel menu pausa (edge, consumato dal chiamante)
     pub restart: bool, // edge: vero per un frame, va consumato dal chiamante
     pub fire: bool,    // edge: spara col fucile (Space)
     pub grenade: bool, // edge: usa granata (G)
@@ -80,6 +82,8 @@ impl InputState {
         InputState {
             intent: 0,
             quit: false,
+            pause: false,
+            confirm: false,
             restart: false,
             fire: false,
             grenade: false,
@@ -134,12 +138,13 @@ impl InputState {
                     self.last_at = Instant::now();
                 }
                 match key.code {
-                    KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => self.quit = true,
                     KeyCode::Char('c') | KeyCode::Char('C')
                         if key.modifiers.contains(KeyModifiers::CONTROL) =>
                     {
                         self.quit = true
                     }
+                    KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => self.pause = true,
+                    KeyCode::Enter => self.confirm = true,
                     KeyCode::Char('r') | KeyCode::Char('R') => self.restart = true,
                     KeyCode::Char(' ') => self.fire = true,
                     KeyCode::Char('g') | KeyCode::Char('G') => self.grenade = true,

@@ -35,10 +35,14 @@ pub const SLOW_MIN_SPEED: f32 = 0.25;
 pub const BULLET_DEFLECTION: f32 = 0.7;
 pub const FREEZE_DURATION: f32 = 1.3;
 pub const GRENADES_MAX: i32 = 2;
-pub const BOT_JITTER: f32 = 0.10;
+pub const BOT_JITTER_MAX: f32  = 0.28;  // jitter massimo per i bot meno abili
+pub const BOT_SPEED_MIN: f32   = 0.52;  // moltiplicatore minimo di velocità
+pub const BOT_FIRE_CD_BASE: f32 = 0.9;  // cooldown base tra uno sparo e l'altro (s)
 pub const SNIPER_AMMO: i32 = 5;    // proiettili letali per item raccolto
 pub const WOUND_KILLS_AT: i32 = 3; // colpi letali per eliminare
 pub const LETHAL_SPEED: f32 = 340.0;
+pub const LIVES_MAX: i32 = 12; // tetto vite con extra-life powerup
+pub const DISCOVERY_PORT: u16 = 5558; // UDP broadcast port per scoperta server LAN
 
 // ---- Wide paddle powerup -------------------------------------------------
 pub const WIDE_PADDLE_DURATION: f32 = 10.0;
@@ -46,6 +50,7 @@ pub const WIDE_PADDLE_HW: f32 = 0.5; // mezza-ampiezza = intero lato
 
 // ---- Item box -------------------------------------------------------------
 pub const ITEM_R: f32 = 5.0;
+pub const ITEM_RING_R: f32 = 8.0; // raggio anello esterno (area di raccolta effettiva)
 pub const ITEM_INTERVAL: f32 = 15.0;   // secondi tra spawn
 pub const ITEM_MAX: usize = 3;
 pub const PARALYSIS_DURATION: f32 = 3.0;
@@ -134,11 +139,19 @@ pub enum ItemKind {
     BlackHole  = 3,
     Sniper     = 4, // proiettili letali: 3 colpi = eliminazione istantanea
     WidePaddle = 5, // paletta larga come tutto il lato per 10 secondi
+    ExtraLife  = 6, // +1 vita istantanea (fino a LIVES_MAX)
 }
 
 pub struct Item {
     pub pos: V2,
     pub kind: ItemKind,
+}
+
+/// Personalità di un bot: generata casualmente a inizio partita e ri-estratta a ogni rivincita.
+pub struct BotState {
+    pub skill: f32,      // 0.0 = scarso, 1.0 = esperto (scala jitter e velocità)
+    pub aggression: f32, // 0.0 = passivo, 1.0 = molto aggressivo (scala frequenza spari/granate)
+    pub fire_cd: f32,    // cooldown rimanente prima del prossimo sparo (secondi)
 }
 
 // ---------------------------------------------------------------------------
@@ -177,7 +190,8 @@ pub struct GameState {
     last_hitter: Option<usize>,
     rng: u64,
     pub start_lives: i32,
-    multiball_guard: Option<usize>, // pid che ha attivato multiball; riceve paletta larga finché ci sono palle extra
+    multiball_guard: Option<usize>,
+    pub bot_states: Vec<BotState>,
 }
 
 impl GameState {
@@ -195,6 +209,15 @@ impl GameState {
             .collect();
         let param_sign = Self::compute_param_sign(n);
         let weapons = (0..n).map(|_| WeaponState::new()).collect();
+        let mut rng_init = seed | 1;
+        let mut bot_states: Vec<BotState> = Vec::with_capacity(n);
+        for _ in 0..n {
+            bot_states.push(BotState {
+                skill: 0.3 + rand_unit(&mut rng_init) * 0.7,
+                aggression: 0.2 + rand_unit(&mut rng_init) * 0.8,
+                fire_cd: 0.0,
+            });
+        }
         let mut g = GameState {
             arena,
             balls: Vec::new(),
@@ -214,6 +237,7 @@ impl GameState {
             rng: seed | 1,
             start_lives: lives,
             multiball_guard: None,
+            bot_states,
         };
         g.serve();
         g
@@ -305,6 +329,11 @@ impl GameState {
         }
         self.last_hitter = None;
         self.multiball_guard = None;
+        for bs in self.bot_states.iter_mut() {
+            bs.skill = 0.3 + rand_unit(&mut self.rng) * 0.7;
+            bs.aggression = 0.2 + rand_unit(&mut self.rng) * 0.8;
+            bs.fire_cd = 0.0;
+        }
         self.serve();
         if let Some(w) = self.sole_survivor() {
             self.phase = Phase::GameOver(w);
@@ -396,10 +425,10 @@ impl GameState {
         if self.weapons[pid].freeze_timer > 0.0 {
             return;
         }
-        // Se trattiene una palla catturata, rilasciala subito mirando verso l'avversario più vicino.
+
+        // Se trattiene una palla catturata, rilasciala mirando verso l'avversario più vicino.
         let holding = self.balls.iter().any(|b| b.captured_by == Some(pid));
         if holding {
-            // Orienta l'intento verso l'avversario vivo più vicino al centro del proprio lato.
             let wi = self.arena.player_wall[pid];
             let w = self.arena.walls[wi];
             let mid = w.point(self.players[pid].c);
@@ -413,25 +442,82 @@ impl GameState {
                 })
                 .next();
             if let Some(dir) = best_dir {
-                // Converti la direzione in intent (+1/-1) lungo il lato.
                 let tangent = (w.b - w.a).norm();
                 let proj = dir.dot(tangent) * self.param_sign[pid];
-                self.weapons[pid].last_intent = if proj > 0.1 { 1 } else if proj < -0.1 { -1 } else { 0 };
+                self.weapons[pid].last_intent =
+                    if proj > 0.1 { 1 } else if proj < -0.1 { -1 } else { 0 };
             }
             self.apply_action(pid, true, false);
             return;
         }
-        // Spara con probabilità ~0.5/s (circa una volta ogni 2 secondi).
-        let fire = self.weapons[pid].ammo > 0 && rand_unit(&mut self.rng) < 0.5 / 60.0;
-        // Usa granata con probabilità ~0.15/s (circa una volta ogni 7 secondi).
-        let grenade =
-            self.weapons[pid].grenades > 0 && rand_unit(&mut self.rng) < 0.15 / 60.0;
-        if fire || grenade {
-            self.apply_action(pid, fire, grenade);
+
+        let aggression = self.bot_states.get(pid).map(|b| b.aggression).unwrap_or(0.5);
+        let fire_cd    = self.bot_states.get(pid).map(|b| b.fire_cd).unwrap_or(1.0);
+
+        // --- Sparo contestuale ---
+        // Preferisce sparare quando ci sono palle dirette verso avversari (momento favorevole)
+        // o quando ha proiettili letali (sniper).
+        let fire = if self.weapons[pid].ammo > 0 && fire_cd <= 0.0 {
+            let wi = self.arena.player_wall[pid];
+            let w  = self.arena.walls[wi];
+            let balls_going_away = self.balls.iter()
+                .filter(|b| b.captured_by.is_none() && b.vel.dot(w.n) > 0.0)
+                .count();
+            let has_sniper = self.weapons[pid].sniper_ammo > 0;
+            let fire_prob = if balls_going_away > 0 || has_sniper {
+                (0.55 + aggression * 0.45) / 60.0
+            } else {
+                (0.04 + aggression * 0.12) / 60.0
+            };
+            rand_unit(&mut self.rng) < fire_prob
+        } else {
+            false
+        };
+
+        // --- Granata situazionale ---
+        // Usata più spesso quando si è in svantaggio di vite; risparmiata in vantaggio.
+        let grenade = if self.weapons[pid].grenades > 0 {
+            let my_lives = self.players[pid].lives;
+            let n_alive = self.players.iter().filter(|p| p.alive).count();
+            let enemy_lives_sum: i32 = self.players.iter().enumerate()
+                .filter(|(i, p)| *i != pid && p.alive)
+                .map(|(_, p)| p.lives)
+                .sum();
+            let avg_enemy = if n_alive > 1 {
+                enemy_lives_sum / (n_alive as i32 - 1)
+            } else {
+                my_lives
+            };
+            let behind = my_lives < avg_enemy;
+            let grenade_prob = if behind {
+                (0.30 + aggression * 0.40) / 60.0
+            } else {
+                (0.04 + aggression * 0.07) / 60.0
+            };
+            rand_unit(&mut self.rng) < grenade_prob
+        } else {
+            false
+        };
+
+        if fire {
+            self.apply_action(pid, true, false);
+            // Cooldown variabile: bot aggressivi/bravi sparano più di frequente
+            let skill = self.bot_states.get(pid).map(|b| b.skill).unwrap_or(0.7);
+            let cd = BOT_FIRE_CD_BASE
+                * (2.0 - aggression)
+                * (0.5 + rand_unit(&mut self.rng) * 0.8)
+                * (1.2 - skill * 0.4);
+            if let Some(bs) = self.bot_states.get_mut(pid) {
+                bs.fire_cd = cd;
+            }
+        }
+        if grenade {
+            self.apply_action(pid, false, true);
         }
     }
 
-    /// Bot: insegue la palla in avvicinamento più vicina al proprio lato.
+    /// Bot: insegue la palla più vicina al proprio lato; se non arriva nessuna palla
+    /// si sposta verso il powerup più vicino. Abilità e velocità scalano con `skill`.
     pub fn bot_step(&mut self, pid: usize, dt: f32) {
         if !self.players[pid].alive {
             return;
@@ -439,37 +525,59 @@ impl GameState {
         if self.weapons[pid].freeze_timer > 0.0 {
             return;
         }
+
+        // Tick cooldown sparo
+        if let Some(bs) = self.bot_states.get_mut(pid) {
+            bs.fire_cd = (bs.fire_cd - dt).max(0.0);
+        }
+
+        let skill = self.bot_states.get(pid).map(|b| b.skill).unwrap_or(0.7);
         let wi = self.arena.player_wall[pid];
-        let w = self.arena.walls[wi];
+        let w  = self.arena.walls[wi];
+
         let mut best: Option<(f32, f32)> = None; // (projected_t, dist_to_wall)
         for ball in &self.balls {
             if ball.captured_by.is_some() {
                 continue;
             }
             if ball.vel.dot(w.n) < 0.0 {
-                let t = project_t(ball.pos, w.a, w.b).clamp(0.0, 1.0);
+                let t    = project_t(ball.pos, w.a, w.b).clamp(0.0, 1.0);
                 let dist = (ball.pos - w.a).dot(w.n);
-                let closer = match best {
-                    None => true,
-                    Some((_, d)) => dist < d,
-                };
-                if closer {
+                if match best { None => true, Some((_, d)) => dist < d } {
                     best = Some((t, dist));
                 }
             }
         }
+
         let target = if let Some((t, _)) = best {
             if matches!(self.phase, Phase::Playing) {
-                let jitter = (rand_unit(&mut self.rng) - 0.5) * 2.0 * BOT_JITTER;
+                // Jitter inversamente proporzionale alla skill
+                let jitter = (rand_unit(&mut self.rng) - 0.5)
+                    * 2.0
+                    * BOT_JITTER_MAX
+                    * (1.0 - skill * 0.85);
                 (t + jitter).clamp(PADDLE_FRAC, 1.0 - PADDLE_FRAC)
             } else {
                 0.5
             }
+        } else if self.items_enabled && !self.items.is_empty() {
+            // Nessuna palla in arrivo: insegui il powerup più vicino alla propria parete
+            let w_center = w.point(0.5);
+            let nearest_t = self.items.iter()
+                .min_by(|a, b| {
+                    let da = (a.pos - w_center).len();
+                    let db = (b.pos - w_center).len();
+                    da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|item| project_t(item.pos, w.a, w.b).clamp(PADDLE_FRAC, 1.0 - PADDLE_FRAC));
+            nearest_t.unwrap_or(0.5)
         } else {
             0.5
         };
+
         let c = self.players[pid].c;
-        let max_step = PADDLE_PARAM_SPEED * 0.85 * dt;
+        let speed_mult = BOT_SPEED_MIN + (1.0 - BOT_SPEED_MIN) * skill;
+        let max_step   = PADDLE_PARAM_SPEED * speed_mult * dt;
         let step = (target - c).clamp(-max_step, max_step);
         self.players[pid].c = (c + step).clamp(PADDLE_FRAC, 1.0 - PADDLE_FRAC);
     }
@@ -752,10 +860,20 @@ impl GameState {
                 if s < BULLET_R {
                     if let Some(owner) = w.owner {
                         if owner != bullet.shooter {
-                            if bullet.lethal {
-                                lethal_targets.push(owner);
+                            // Effetto solo se colpisce la racchetta (non "in porta")
+                            let t = project_t(bullet.pos, w.a, w.b);
+                            let pc = self.players[owner].c;
+                            let hw = if self.weapons[owner].wide_paddle_timer > 0.0 {
+                                WIDE_PADDLE_HW
                             } else {
-                                slow_targets.push(owner);
+                                PADDLE_FRAC
+                            };
+                            if (t - pc).abs() <= hw {
+                                if bullet.lethal {
+                                    lethal_targets.push(owner);
+                                } else {
+                                    slow_targets.push(owner);
+                                }
                             }
                         }
                     }
@@ -808,7 +926,7 @@ impl GameState {
                 if self.balls[bi].captured_by.is_some() {
                     continue;
                 }
-                if (self.balls[bi].pos - item_pos).len() < BALL_R + ITEM_R {
+                if (self.balls[bi].pos - item_pos).len() < BALL_R + ITEM_RING_R {
                     hits.push((ii, bi));
                     break;
                 }
@@ -872,7 +990,86 @@ impl GameState {
                             .max(self.weapons[pid].wide_paddle_timer);
                     }
                 }
+                ItemKind::ExtraLife => {
+                    if let Some(pid) = activator {
+                        if self.players[pid].alive && self.players[pid].lives < LIVES_MAX {
+                            self.players[pid].lives += 1;
+                        }
+                    }
+                }
             }
+        }
+
+        // Bullet-item collision: uno sparo può raccogliere un powerup per il tiratore.
+        let mut bullet_hits: Vec<(usize, usize, usize)> = Vec::new(); // (item_idx, bullet_idx, shooter)
+        'bitem: for ii in 0..self.items.len() {
+            let ipos = self.items[ii].pos;
+            for (bi, bullet) in self.bullets.iter().enumerate() {
+                if (bullet.pos - ipos).len() < BULLET_R + ITEM_RING_R {
+                    bullet_hits.push((ii, bi, bullet.shooter));
+                    continue 'bitem;
+                }
+            }
+        }
+        bullet_hits.sort_by_key(|&(ii, _, _)| ii);
+        bullet_hits.dedup_by_key(|&mut (ii, _, _)| ii);
+        let mut bul_remove: Vec<usize> = bullet_hits.iter().map(|&(_, bi, _)| bi).collect();
+        bul_remove.sort_unstable();
+        bul_remove.dedup();
+        for (ii, _, shooter) in bullet_hits.into_iter().rev() {
+            if ii >= self.items.len() { continue; }
+            let item = self.items.remove(ii);
+            self.last_hitter = Some(shooter);
+            let activator = Some(shooter);
+            match item.kind {
+                ItemKind::Multiball => {
+                    let speed = self.current_min_speed();
+                    for _ in 0..4 {
+                        let a = rand_unit(&mut self.rng) * std::f32::consts::TAU;
+                        self.balls.push(Ball { pos: item.pos, vel: v2(a.cos(), a.sin()) * speed, captured_by: None });
+                    }
+                    if let Some(pid) = activator {
+                        self.weapons[pid].wide_paddle_timer = 99.0;
+                        self.multiball_guard = Some(pid);
+                    }
+                }
+                ItemKind::Paralysis => {
+                    if let Some(pid) = activator {
+                        let n = self.players.len();
+                        for other in 0..n {
+                            if other != pid && self.players[other].alive {
+                                self.weapons[other].freeze_timer = PARALYSIS_DURATION.max(self.weapons[other].freeze_timer);
+                            }
+                        }
+                    }
+                }
+                ItemKind::Capture => {
+                    if let Some(pid) = activator { self.weapons[pid].capture_ready = true; }
+                }
+                ItemKind::BlackHole => {
+                    self.black_hole_timer = BLACK_HOLE_DURATION.max(self.black_hole_timer);
+                }
+                ItemKind::Sniper => {
+                    if let Some(pid) = activator {
+                        self.weapons[pid].sniper_ammo = (self.weapons[pid].sniper_ammo + SNIPER_AMMO).min(SNIPER_AMMO * 2);
+                    }
+                }
+                ItemKind::WidePaddle => {
+                    if let Some(pid) = activator {
+                        self.weapons[pid].wide_paddle_timer = WIDE_PADDLE_DURATION.max(self.weapons[pid].wide_paddle_timer);
+                    }
+                }
+                ItemKind::ExtraLife => {
+                    if let Some(pid) = activator {
+                        if self.players[pid].alive && self.players[pid].lives < LIVES_MAX {
+                            self.players[pid].lives += 1;
+                        }
+                    }
+                }
+            }
+        }
+        for bi in bul_remove.into_iter().rev() {
+            if bi < self.bullets.len() { self.bullets.remove(bi); }
         }
 
         // Spawn timer: aggiornato DOPO la collision così il nuovo item non può
@@ -885,14 +1082,15 @@ impl GameState {
                 let angle = rand_unit(&mut self.rng) * std::f32::consts::TAU;
                 let dist = rand_unit(&mut self.rng).sqrt() * R * 0.4;
                 let pos = v2(angle.cos() * dist, angle.sin() * dist);
-                let k = xorshift(&mut self.rng) % 6;
+                let k = xorshift(&mut self.rng) % 7;
                 let kind = match k {
                     0 => ItemKind::Multiball,
                     1 => ItemKind::Paralysis,
                     2 => ItemKind::Capture,
                     3 => ItemKind::BlackHole,
                     4 => ItemKind::Sniper,
-                    _ => ItemKind::WidePaddle,
+                    5 => ItemKind::WidePaddle,
+                    _ => ItemKind::ExtraLife,
                 };
                 self.items.push(Item { pos, kind });
                 self.item_spawn_timer = ITEM_INTERVAL;

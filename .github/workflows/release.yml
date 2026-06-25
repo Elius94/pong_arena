@@ -1,13 +1,29 @@
 name: Build and Release
+
 on:
   push:
     tags:
       - 'v*'
+
 jobs:
   release:
-    runs-on: ubuntu-latest
+    name: Build and Release for ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
     permissions:
       contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_name: pong_arena
+            asset_name: pong_arena-linux-amd64
+          - os: windows-latest
+            artifact_name: pong_arena.exe
+            asset_name: pong_arena-windows-amd64.exe
+          - os: macos-latest
+            artifact_name: pong_arena
+            asset_name: pong_arena-macos-universal
 
     steps:
       - name: Checkout code
@@ -19,10 +35,16 @@ jobs:
       - name: Build release binary
         run: cargo build --release
 
+      # Questo step rinomina il file prima del caricamento per evitare che su Linux e Mac abbiano lo stesso nome
+      - name: Rename artifact for release
+        shell: bash
+        run: |
+          mv target/release/${{ matrix.artifact_name }} target/release/${{ matrix.asset_name }}
+
       - name: Create Release and Upload Asset
         uses: softprops/action-gh-release@v2
         with:
-          files: ./target/release/pong_arena
+          files: ./target/release/${{ matrix.asset_name }}
           name: Release ${{ github.ref_name }}
           draft: false
           prerelease: false

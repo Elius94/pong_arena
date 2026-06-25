@@ -3,6 +3,7 @@
 use crate::game::*;
 use crate::net::*;
 use crate::render::{self, Frame};
+use crate::replay;
 use crate::scores;
 use crate::terminal::{poll_key, InputState, Key, TerminalGuard};
 use std::collections::VecDeque;
@@ -61,12 +62,37 @@ fn compose(snap: &Snapshot, my_id: usize, title_right: &str, names: &[String]) -
     let rows_n = rows as usize;
     let blank_row = format!("\x1b[0m{}", " ".repeat(cols as usize));
     let mut out = String::new();
-    for r in 0..or_ {
+    // Righe 0 e 1 (titolo e lista giocatori) e ultima riga sono gestite da chrome(),
+    // non vengono azzerate qui per evitare il doppio-write che causa flickering su Windows.
+    for r in 2..or_ {
         out.push_str(&format!("\x1b[{};1H{}", r + 1, blank_row));
     }
-    for r in (or_ + ch)..rows_n {
+    for r in (or_ + ch)..rows_n.saturating_sub(1) {
         out.push_str(&format!("\x1b[{};1H{}", r + 1, blank_row));
     }
+    // Pickup animation: confronta items col frame precedente, lancia animazioni per quelli scomparsi.
+    let curr_items: Vec<(f32, f32, u8)> = snap.items.iter()
+        .map(|(pos, k)| (pos.x, pos.y, *k)).collect();
+    PICKUP_ANIMS.with(|anims_cell| {
+        PREV_ITEMS.with(|prev_cell| {
+            let prev = prev_cell.borrow();
+            let mut anims = anims_cell.borrow_mut();
+            for &(px, py, pk) in prev.iter() {
+                if !snap.items.iter().any(|(pos, k)| {
+                    (pos.x - px).abs() < 0.5 && (pos.y - py).abs() < 0.5 && *k == pk
+                }) {
+                    anims.push(PickupAnim { wx: px, wy: py, kind: pk, timer: 0.7 });
+                }
+            }
+            for a in anims.iter_mut() { a.timer -= 1.0 / 60.0; }
+            anims.retain(|a| a.timer > 0.0);
+        });
+    });
+    PREV_ITEMS.with(|p| *p.borrow_mut() = curr_items);
+    let anim_list: Vec<(f32, f32, u8, f32)> = PICKUP_ANIMS.with(|a| {
+        a.borrow().iter().map(|a| (a.wx, a.wy, a.kind, a.timer)).collect()
+    });
+
     let mut frame = Frame::new(cw, ch);
     let trail = TRAIL.with(|t| t.borrow().clone());
     render::draw_arena(&mut frame, snap, my_id, &trail);
@@ -83,6 +109,9 @@ fn compose(snap: &Snapshot, my_id: usize, title_right: &str, names: &[String]) -
     out.push_str(&render::player_name_labels(
         snap, names, cw, ch, oc, or_, my_id, cols as usize, rows_n,
     ));
+    out.push_str(&render::pickup_anim_overlay(
+        &anim_list, snap.n, my_id, cw, ch, oc, or_,
+    ));
     if snap.phase_code == 2 {
         out.push_str(&render::game_over_overlay(
             cols as usize,
@@ -92,19 +121,29 @@ fn compose(snap: &Snapshot, my_id: usize, title_right: &str, names: &[String]) -
             names,
         ));
     }
-    // Overlay granata: mostrato solo al giocatore congelato da una granata avversaria.
-    if let Some(&(_, _, freeze_t, _, cap, _, _, _)) = snap.weapons.get(my_id) {
-        if freeze_t > 0.0 && cap & 0x04 != 0 {
-            out.push_str(&render::grenade_overlay(cols as usize, rows_n, freeze_t));
-        }
-    }
+    // Overlay granata: sempre chiamato così ripulisce i bordi quando l'effetto finisce.
+    let grenade_freeze_t = snap.weapons.get(my_id)
+        .map(|&(_, _, ft, _, cap, _, _, _)| if ft > 0.0 && cap & 0x04 != 0 { ft } else { 0.0 })
+        .unwrap_or(0.0);
+    out.push_str(&render::grenade_overlay(cols as usize, rows_n, or_, oc, cw, grenade_freeze_t));
     out
 }
 
-// Scia condivisa per il rendering locale (semplice, thread-local).
+// Scia condivisa + animazioni raccolta item (thread-local, singolo thread di rendering).
+struct PickupAnim {
+    wx: f32,
+    wy: f32,
+    kind: u8,
+    timer: f32, // scende da 0.7 a 0.0
+}
+
 thread_local! {
     static TRAIL: std::cell::RefCell<VecDeque<(f32, f32)>> =
         std::cell::RefCell::new(VecDeque::new());
+    static PICKUP_ANIMS: std::cell::RefCell<Vec<PickupAnim>> =
+        std::cell::RefCell::new(Vec::new());
+    static PREV_ITEMS: std::cell::RefCell<Vec<(f32, f32, u8)>> =
+        std::cell::RefCell::new(Vec::new());
 }
 
 fn push_trail(p: (f32, f32)) {
@@ -338,8 +377,10 @@ pub fn run_host(port: u16, bots: usize, host_name: String, lives: i32) -> std::i
         is_bot[pid] = true;
     }
     let _ = bots_used;
+    let n_human_guests = guests_used;
 
     // --- Game loop ---
+    let mut replay_frames: Vec<String> = Vec::new();
     let mut game = GameState::new(n, seed(), lives);
     game.set_names(&all_names);
     let mut input = InputState::new();
@@ -350,14 +391,73 @@ pub fn run_host(port: u16, bots: usize, host_name: String, lives: i32) -> std::i
 
     let title = format!("{} · {} giocatori · porta {}", all_names[0], n, port);
 
+    // Pausa: None=in gioco, Some(false)=menu pausa solo, Some(true)=abbandono multi
+    let mut pause_mode: Option<bool> = None;
+    let mut pause_sel: usize = 0;
+    let mut nav_cd = 0.0f32;
+
+    // Spettatori che si connettono a partita già avviata
+    let mut spec_writers: Vec<TcpStream> = Vec::new();
+
+    // UDP broadcast per scoperta LAN
+    let udp_sock: Option<std::net::UdpSocket> =
+        std::net::UdpSocket::bind("0.0.0.0:0").ok().and_then(|s| {
+            s.set_broadcast(true).ok()?;
+            s.set_nonblocking(true).ok()?;
+            Some(s)
+        });
+    let mut udp_timer = 0.0f32;
+
     loop {
         let now = Instant::now();
         let dt = (now - last).as_secs_f32().min(0.05);
         last = now;
+        nav_cd -= dt;
 
         input.pump()?;
-        if input.quit {
-            break;
+        if input.quit { break; } // Ctrl+C: uscita immediata
+
+        // Gestione pausa / abbandono
+        if input.pause {
+            input.pause = false;
+            if pause_mode.is_none() {
+                pause_mode = Some(n_human_guests > 0);
+                pause_sel = 0;
+            } else {
+                pause_mode = None; // ESC chiude il menu senza azione
+            }
+        }
+        if pause_mode.is_some() {
+            if nav_cd <= 0.0 && input.intent != 0 {
+                pause_sel = 1 - pause_sel;
+                nav_cd = 0.20;
+            }
+            if input.confirm {
+                input.confirm = false;
+                if pause_sel == 1 { break; } else { pause_mode = None; }
+            }
+        }
+        input.confirm = false;
+
+        // Accetta nuove connessioni a partita in corso come spettatori
+        loop {
+            match listener.accept() {
+                Ok((mut s, _)) => {
+                    let _ = s.set_nodelay(true);
+                    let _ = s.set_nonblocking(false);
+                    let _ = s.set_write_timeout(Some(Duration::from_millis(100)));
+                    let spec_msg  = format!("SPEC {}\n", n);
+                    let names_msg = format!("NAMES {}\n", all_names.join("|"));
+                    if s.write_all(spec_msg.as_bytes()).is_ok()
+                        && s.write_all(names_msg.as_bytes()).is_ok()
+                        && s.flush().is_ok()
+                    {
+                        spec_writers.push(s);
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                _ => break,
+            }
         }
 
         // Disconnessioni dei guest.
@@ -371,7 +471,6 @@ pub fn run_host(port: u16, bots: usize, host_name: String, lives: i32) -> std::i
         }
 
         // Restart (solo a fine partita) da host o da un qualsiasi guest.
-        // Raccoglie anche le azioni armi dei guest (edge-triggered).
         let mut want_restart = input.restart;
         let mut guest_actions: Vec<(bool, bool)> = vec![(false, false); n];
         for pid in 1..n {
@@ -388,45 +487,61 @@ pub fn run_host(port: u16, bots: usize, host_name: String, lives: i32) -> std::i
         }
         input.restart = false;
 
-        // Movimento e armi: host (pid 0), guest (input di rete), bot (IA).
-        game.apply_input(0, input.intent, dt);
-        game.apply_action(0, input.fire, input.grenade);
-        input.fire = false;
-        input.grenade = false;
-        for pid in 1..n {
-            if is_bot[pid] {
-                game.bot_step(pid, dt);
-                game.bot_action(pid);
-            } else if let Some(ch) = &inputs[pid] {
-                game.apply_input(pid, ch.get().intent, dt);
-                let (fire, grenade) = guest_actions[pid];
-                game.apply_action(pid, fire, grenade);
+        // Movimento e armi — saltato se in pausa solo-player
+        let is_solo_paused = matches!(pause_mode, Some(false));
+        if !is_solo_paused {
+            game.apply_input(0, input.intent, dt);
+            game.apply_action(0, input.fire, input.grenade);
+            input.fire = false;
+            input.grenade = false;
+            for pid in 1..n {
+                if is_bot[pid] {
+                    game.bot_step(pid, dt);
+                    game.bot_action(pid);
+                } else if let Some(ch) = &inputs[pid] {
+                    game.apply_input(pid, ch.get().intent, dt);
+                    let (fire, grenade) = guest_actions[pid];
+                    game.apply_action(pid, fire, grenade);
+                }
             }
+            game.step(dt);
+        } else {
+            input.fire = false;
+            input.grenade = false;
         }
-
-        game.step(dt);
 
         // Salva la classifica al primo frame di GameOver.
         if !score_saved {
             if let Phase::GameOver(winner) = game.phase {
-                let winner_name = all_names
-                    .get(winner)
-                    .map(|s| s.as_str())
-                    .unwrap_or("");
+                let winner_name = all_names.get(winner).map(|s| s.as_str()).unwrap_or("");
                 scores::update(winner_name, &all_names, &game.kills);
                 score_saved = true;
             }
         }
 
-        // Snapshot a tutti i client.
+        // Snapshot a tutti i client e agli spettatori.
         let snap = game.snapshot();
         let line = snap.encode();
+        replay_frames.push(line.clone());
         for pid in 1..n {
             if let Some(w) = writers[pid].as_mut() {
                 if w.write_all(line.as_bytes()).is_err() || w.flush().is_err() {
-                    // marca disconnesso al prossimo giro tramite il reader
                     writers[pid] = None;
                 }
+            }
+        }
+        spec_writers.retain_mut(|sw| {
+            sw.write_all(line.as_bytes()).is_ok() && sw.flush().is_ok()
+        });
+
+        // UDP broadcast per scoperta LAN
+        udp_timer -= dt;
+        if udp_timer <= 0.0 {
+            udp_timer = 2.0;
+            let conn_count = game.players.iter().filter(|p| p.connected).count();
+            let msg = format!("PONG_ARENA v1 {} {}/{}\n", port, conn_count, n);
+            if let Some(ref sock) = udp_sock {
+                let _ = sock.send_to(msg.as_bytes(), ("255.255.255.255", DISCOVERY_PORT));
             }
         }
 
@@ -441,12 +556,24 @@ pub fn run_host(port: u16, bots: usize, host_name: String, lives: i32) -> std::i
             last_size = size;
             render::flush("\x1b[2J")?;
         }
-        render::flush(&compose(&snap, 0, &title, &all_names))?;
+        let mut frame_str = compose(&snap, 0, &title, &all_names);
+        if let Some(is_abandon) = pause_mode {
+            let (cols, rows) = term_size();
+            frame_str.push_str(&render::pause_overlay(
+                cols as usize, rows as usize, is_abandon, true, pause_sel,
+            ));
+        }
+        render::flush(&frame_str)?;
 
         let elapsed = now.elapsed();
         if elapsed < FRAME {
             std::thread::sleep(FRAME - elapsed);
         }
+    }
+
+    // Salva il replay se la partita ha avuto abbastanza frame (> 5 secondi circa)
+    if replay_frames.len() > 300 {
+        let _ = replay::save(&replay_frames, &all_names);
     }
 
     Ok(())
@@ -466,9 +593,9 @@ pub fn run_guest(addr: &str, port: u16, my_name: String) -> std::io::Result<()> 
     writer.write_all(format!("NAME {}\n", my_name).as_bytes())?;
     writer.flush()?;
 
-    // Attendi l'handshake START (durante la lobby arrivano righe LOBBY).
+    // Attendi START (normale), SPEC (spettatore mid-game) o LOBBY (in attesa).
     println!("Connesso. In attesa che l'host avvii la partita…");
-    let (my_id, n, mut all_names) = loop {
+    let (my_id, n, mut all_names, is_spectator) = loop {
         let mut line = String::new();
         let read = reader.read_line(&mut line)?;
         if read == 0 {
@@ -479,14 +606,20 @@ pub fn run_guest(addr: &str, port: u16, my_name: String) -> std::io::Result<()> 
         if let Some(rest) = line.strip_prefix("START ") {
             let mut it = rest.split_whitespace();
             let id: usize = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
-            let n: usize = it.next().and_then(|v| v.parse().ok()).unwrap_or(2);
-            // Ignora eventuali campi extra (lives, name) nel messaggio START.
-            // La prossima riga dovrebbe essere NAMES.
+            let n: usize  = it.next().and_then(|v| v.parse().ok()).unwrap_or(2);
             let mut names_line = String::new();
             reader.read_line(&mut names_line)?;
             let names_str = names_line.trim().strip_prefix("NAMES ").unwrap_or("");
             let names: Vec<String> = names_str.split('|').map(|s| s.to_string()).collect();
-            break (id, n, names);
+            break (id, n, names, false);
+        } else if let Some(rest) = line.strip_prefix("SPEC ") {
+            // Partita già in corso: entra come spettatore
+            let n: usize = rest.trim().parse().unwrap_or(2);
+            let mut names_line = String::new();
+            reader.read_line(&mut names_line)?;
+            let names_str = names_line.trim().strip_prefix("NAMES ").unwrap_or("");
+            let names: Vec<String> = names_str.split('|').map(|s| s.to_string()).collect();
+            break (n, n, names, true); // my_id = n (sentinella fuori-bounds = no HUD personale)
         } else if let Some(rest) = line.strip_prefix("LOBBY ") {
             println!("  giocatori in lobby: {}", rest.trim());
         }
@@ -503,30 +636,66 @@ pub fn run_guest(addr: &str, port: u16, my_name: String) -> std::io::Result<()> 
         all_names.push(format!("Giocatore {}", all_names.len() + 1));
     }
 
-    let title = format!("{} · giocatore {} di {}", all_names[my_id], my_id + 1, n);
+    let title = if is_spectator {
+        format!("SPETTATORE — {} giocatori", n)
+    } else {
+        format!("{} · giocatore {} di {}", all_names[my_id], my_id + 1, n)
+    };
     clear_trail();
+
+    // Stato abbandono partita (Q/ESC)
+    let mut show_abandon = false;
+    let mut abandon_sel: usize = 0;
+    let mut nav_cd = 0.0f32;
+    let mut last_frame = Instant::now();
 
     loop {
         let frame_start = Instant::now();
-        input.pump()?;
+        let dt = (frame_start - last_frame).as_secs_f32().min(0.05);
+        last_frame = frame_start;
+        nav_cd -= dt;
 
-        // Invia il proprio input.
-        let ni = NetInput {
-            intent: input.intent,
-            restart: input.restart,
-            quit: input.quit,
-            fire: input.fire,
-            grenade: input.grenade,
-        };
-        let _ = writer.write_all(ni.encode().as_bytes());
-        let _ = writer.flush();
+        input.pump()?;
+        if input.quit { break; } // Ctrl+C: uscita immediata
+
+        // ESC/Q → conferma abbandono (spettatori escono direttamente)
+        if input.pause {
+            input.pause = false;
+            if is_spectator {
+                break;
+            }
+            show_abandon = !show_abandon;
+            if show_abandon { abandon_sel = 0; nav_cd = 0.0; }
+        }
+
+        // Navigazione menu abbandono
+        if show_abandon {
+            if nav_cd <= 0.0 && input.intent != 0 {
+                abandon_sel = 1 - abandon_sel;
+                nav_cd = 0.20;
+            }
+            if input.confirm {
+                input.confirm = false;
+                if abandon_sel == 1 { break; } else { show_abandon = false; }
+            }
+        }
+        input.confirm = false;
+
+        // Invia il proprio input (non per spettatori, non durante menu abbandono)
+        if !is_spectator {
+            let ni = NetInput {
+                intent: if show_abandon { 0 } else { input.intent },
+                restart: input.restart,
+                quit: false,
+                fire: if show_abandon { false } else { input.fire },
+                grenade: if show_abandon { false } else { input.grenade },
+            };
+            let _ = writer.write_all(ni.encode().as_bytes());
+            let _ = writer.flush();
+        }
         input.restart = false;
         input.fire = false;
         input.grenade = false;
-
-        if input.quit {
-            break;
-        }
 
         if chan.is_disconnected() {
             let (cols, rows) = term_size();
@@ -540,11 +709,8 @@ pub fn run_guest(addr: &str, port: u16, my_name: String) -> std::io::Result<()> 
                 msg
             ));
             render::flush(&s)?;
-            // attende un tasto per uscire
             loop {
-                if poll_key()?.is_some() {
-                    break;
-                }
+                if poll_key()?.is_some() { break; }
                 std::thread::sleep(Duration::from_millis(30));
             }
             break;
@@ -561,7 +727,18 @@ pub fn run_guest(addr: &str, port: u16, my_name: String) -> std::io::Result<()> 
                 last_size = size;
                 render::flush("\x1b[2J")?;
             }
-            render::flush(&compose(&snap, my_id, &title, &all_names))?;
+            // Spettatori usano my_id = n (nessun HUD personale; vista neutra)
+            let render_id = if is_spectator { snap.n } else { my_id };
+            let mut frame_str = compose(&snap, render_id, &title, &all_names);
+            let (cols, rows) = term_size();
+            if is_spectator {
+                frame_str.push_str(&render::spectator_overlay(cols as usize, rows as usize));
+            } else if show_abandon {
+                frame_str.push_str(&render::pause_overlay(
+                    cols as usize, rows as usize, true, false, abandon_sel,
+                ));
+            }
+            render::flush(&frame_str)?;
         }
 
         let elapsed = frame_start.elapsed();
@@ -571,17 +748,109 @@ pub fn run_guest(addr: &str, port: u16, my_name: String) -> std::io::Result<()> 
     }
 
     // Saluto finale: comunica l'uscita all'host.
-    let _ = writer.write_all(
-        NetInput {
-            intent: 0,
-            restart: false,
-            quit: true,
-            fire: false,
-            grenade: false,
+    if !is_spectator {
+        let _ = writer.write_all(
+            NetInput { intent: 0, restart: false, quit: true, fire: false, grenade: false }
+                .encode()
+                .as_bytes(),
+        );
+        let _ = writer.flush();
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Replay.
+// ---------------------------------------------------------------------------
+pub fn run_replay(path: &std::path::Path) -> std::io::Result<()> {
+    let rep = replay::load(path).map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::Other, format!("replay: {e}"))
+    })?;
+    if rep.frames.is_empty() {
+        return Ok(());
+    }
+
+    let _guard = TerminalGuard::new()?;
+    let mut input = InputState::new();
+    let mut frame_idx: usize = 0;
+    let mut speed: usize = 1; // 1x 2x 4x 8x 16x
+    let mut paused = false;
+    let mut last = Instant::now();
+    let mut last_size = term_size();
+    let mut speed_cd = 0.0f32;
+    clear_trail();
+
+    let total = rep.frames.len();
+
+    loop {
+        let now = Instant::now();
+        let dt = (now - last).as_secs_f32().min(0.05);
+        last = now;
+        speed_cd -= dt;
+
+        input.pump()?;
+
+        // Ctrl+C o Q/ESC → esci
+        if input.quit || input.pause { break; }
+
+        // Space (fire) o Enter (confirm) → pausa / riprendi
+        if input.fire || input.confirm {
+            paused = !paused;
         }
-        .encode()
-        .as_bytes(),
-    );
-    let _ = writer.flush();
+        input.fire = false;
+        input.confirm = false;
+
+        // R → ricomincia dall'inizio
+        if input.restart {
+            input.restart = false;
+            frame_idx = 0;
+            paused = false;
+            clear_trail();
+        }
+
+        // ←/→ → cambia velocità (con cooldown per evitare cambi multipli a frame)
+        if speed_cd <= 0.0 && input.intent != 0 {
+            if input.intent > 0 { speed = (speed * 2).min(16); }
+            else                { speed = (speed / 2).max(1);  }
+            speed_cd = 0.25;
+        }
+
+        // Avanza i frame
+        if !paused && frame_idx < total.saturating_sub(1) {
+            frame_idx = (frame_idx + speed).min(total - 1);
+        }
+        if frame_idx >= total - 1 {
+            paused = true;
+        }
+
+        // Rendering
+        let frame_line = &rep.frames[frame_idx];
+        if let Some(snap) = Snapshot::decode(frame_line) {
+            if snap.phase_code == 1 {
+                if let Some(b) = snap.balls.first() {
+                    push_trail((b.x, b.y));
+                }
+            }
+            let size = term_size();
+            if size != last_size {
+                last_size = size;
+                render::flush("\x1b[2J")?;
+            }
+            let pct = if total > 1 { frame_idx * 100 / (total - 1) } else { 100 };
+            let icon = if paused { "⏸" } else { "▶" };
+            let title = format!(
+                "{} ×{}  {}/{}  {}%",
+                icon, speed, frame_idx + 1, total, pct
+            );
+            let frame_str = compose(&snap, 0, &title, &rep.names);
+            render::flush(&frame_str)?;
+        }
+
+        let elapsed = now.elapsed();
+        if elapsed < FRAME {
+            std::thread::sleep(FRAME - elapsed);
+        }
+    }
+
     Ok(())
 }

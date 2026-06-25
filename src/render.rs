@@ -285,19 +285,31 @@ pub fn draw_arena(f: &mut Frame, snap: &Snapshot, my_id: usize, trail: &VecDeque
         f.disc(px, py, r, col);
     }
 
-    // Item box.
-    for &(pos, kind) in &snap.items {
-        let (ix, iy) = view.px(pos);
-        let r = (ITEM_R * view.scale).max(4.0);
-        let col = item_color(kind);
-        f.fill(
-            (ix - r) as i32,
-            (iy - r) as i32,
-            (ix + r) as i32 + 1,
-            (iy + r) as i32 + 1,
-            col,
-        );
-        f.disc(ix, iy, (r * 0.35).max(1.5), (255, 255, 255));
+    // Item box con anello esterno pulsante che indica l'area di raccolta.
+    {
+        use std::time::SystemTime;
+        let ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as f32;
+        let pulse = (ms * 0.005).sin() * 0.5 + 0.5; // 0..1, ~3.2 s
+        for &(pos, kind) in &snap.items {
+            let (ix, iy) = view.px(pos);
+            let r      = (ITEM_R       * view.scale).max(4.0);
+            let ring_r = (ITEM_RING_R  * view.scale).max(5.5);
+            let col = item_color(kind);
+            // Anello esterno (area pickup) — colore attenuato e pulsante
+            let ring_col = mix(BG, col, 0.35 + 0.25 * pulse);
+            f.disc(ix, iy, ring_r, ring_col);
+            // Quadrato colorato al centro
+            f.fill(
+                (ix - r) as i32, (iy - r) as i32,
+                (ix + r) as i32 + 1, (iy + r) as i32 + 1,
+                col,
+            );
+            // Puntino bianco
+            f.disc(ix, iy, (r * 0.35).max(1.5), (255, 255, 255));
+        }
     }
 
     // Buco nero al centro dell'arena.
@@ -356,7 +368,9 @@ fn item_color(kind: u8) -> Rgb {
         2 => (50, 220, 220),  // Capture: acqua
         3 => (90, 0, 120),    // BlackHole: viola scuro
         4 => (255, 60, 60),   // Sniper: rosso acceso
-        _ => (50, 255, 120),  // WidePaddle: verde brillante
+        5 => (50, 255, 120),  // WidePaddle: verde brillante
+        6 => (255, 100, 130), // ExtraLife: rosa-rosso
+        _ => (200, 200, 200),
     }
 }
 
@@ -400,6 +414,28 @@ pub fn blit(f: &Frame, origin_col: usize, origin_row: usize) -> String {
 // ---------------------------------------------------------------------------
 // Testo di contorno.
 // ---------------------------------------------------------------------------
+fn item_kind_display(kind: u8) -> (&'static str, Rgb) {
+    match kind {
+        0 => ("⦿ MULTIBALL",  (255, 210, 50)),
+        1 => ("❄ PARALISI",   (80, 190, 255)),
+        2 => ("◎ CATTURA",    (160, 255, 100)),
+        3 => ("☯ BUCO NERO",  (160, 100, 255)),
+        4 => ("⊕ SNIPER",     (255, 150, 60)),
+        5 => ("⬛ RACCHETTA", (100, 255, 160)),
+        6 => ("♥ VITA+1",     (255, 100, 130)),
+        _ => ("? ITEM",       (200, 200, 200)),
+    }
+}
+
+fn blend_color(a: Rgb, b: Rgb, t: f32) -> Rgb {
+    let t = t.clamp(0.0, 1.0);
+    (
+        (a.0 as f32 * (1.0 - t) + b.0 as f32 * t) as u8,
+        (a.1 as f32 * (1.0 - t) + b.1 as f32 * t) as u8,
+        (a.2 as f32 * (1.0 - t) + b.2 as f32 * t) as u8,
+    )
+}
+
 fn text_at(out: &mut String, row: usize, col: usize, fg: Rgb, s: &str) {
     ansi_move(out, row, col);
     out.push_str(&format!("\x1b[38;2;{};{};{}m{}\x1b[0m", fg.0, fg.1, fg.2, s));
@@ -422,176 +458,182 @@ pub fn chrome(
     names: &[String],
 ) -> String {
     let mut out = String::new();
-    let dim = (120, 130, 150);
-    let accent = (90, 224, 205);
+    let dim:    Rgb = (100, 108, 128);
+    let accent: Rgb = (90, 224, 205);
+    let sep:    Rgb = (55, 62, 82);
+    let blank  = " ".repeat(cols);
 
+    // ── Riga 0: titolo — azzerata e riscritta in un colpo solo ───────────────
+    ansi_move(&mut out, 0, 0);
+    out.push_str(&format!("\x1b[0m{}", blank)); // azzera la riga
     text_at(&mut out, 0, 1, accent, "▌ PONG · ARENA ▐");
     text_at(
-        &mut out,
-        0,
+        &mut out, 0,
         cols.saturating_sub(title_right.chars().count() + 1),
-        dim,
-        title_right,
+        dim, title_right,
     );
 
-    // Riga giocatori: nomi colorati + contatore granate.
+    // ── Riga 1: giocatori — azzerata prima di scrivere (evita ghost da frame precedente)
+    ansi_move(&mut out, 1, 0);
+    out.push_str(&format!("\x1b[0m{}", blank));
+    // ── Riga 1 cont.: giocatori separati da │, si ferma prima del pannello ──
+    let panel_col = cols.saturating_sub(29);
     if let Some(sc) = snap {
-        let mut px = 1;
-        for (i, ((_c, _lives, alive), wep)) in sc.players.iter().zip(sc.weapons.iter()).enumerate() {
-            let name = names.get(i).map(|s| s.as_str()).unwrap_or("???");
-            let marker = if i == my_id { "▸" } else { " " };
+        let mut px = 1usize;
+        for (i, ((_, lives, alive), wep)) in sc.players.iter().zip(sc.weapons.iter()).enumerate() {
+            if px + 4 >= panel_col { break; }
+            if i > 0 {
+                text_at(&mut out, 1, px, sep, "│");
+                px += 2;
+            }
+            let name = names.get(i).map(|s| s.as_str()).unwrap_or("?");
             let (_, _, _, grenades, _, _, _, _) = *wep;
+            let marker = if i == my_id { "▸" } else { " " };
             let grens: String = (0..GRENADES_MAX as usize)
                 .map(|k| if k < grenades as usize { '◆' } else { '◇' })
                 .collect();
             let label = if *alive {
-                format!("{}{}♥{} {}", marker, name, _lives, grens)
+                format!("{}{} ♥{} {}", marker, name, (*lives).max(0), grens)
             } else {
-                format!("{}{}✗", marker, name)
+                format!("{}{} ✗", marker, name)
             };
+            let max_ch = panel_col.saturating_sub(px + 1);
+            let clipped: String = label.chars().take(max_ch).collect();
             let col = if *alive { player_color(i) } else { dim };
-            text_at(&mut out, 1, px, col, &label);
-            px += label.chars().count() + 2;
-            if px >= cols {
-                break;
-            }
+            text_at(&mut out, 1, px, col, &clipped);
+            px += clipped.chars().count() + 1;
+            if px >= panel_col { break; }
         }
     }
 
-    // Pannello legenda powerup — colonna destra, righe 2..2+n.
+    // ── Pannello POTERI (colonna destra, riga 2+) ───────────────────────────
     if let Some(sc) = snap {
-        let panel_col = cols.saturating_sub(27);
-        let header = "── powerup ──────────────";
-        text_at(&mut out, 2, panel_col, dim, header);
-        for (i, ((_c_f, _lives, alive), wep)) in
-            sc.players.iter().zip(sc.weapons.iter()).enumerate()
-        {
+        text_at(&mut out, 2, panel_col, dim, "── POTERI ─────────────");
+        for (i, ((_, lives, alive), wep)) in sc.players.iter().zip(sc.weapons.iter()).enumerate() {
             let row = 3 + i;
-            if row + 1 >= rows.saturating_sub(1) {
-                break;
-            }
+            if row + 1 >= rows.saturating_sub(1) { break; }
             let (_, _, freeze_t, grenades, cap, sniper, _wounds, wide_t) = *wep;
-            let name = names.get(i).map(|s| s.as_str()).unwrap_or("?");
-            let short: String = name.chars().take(6).collect();
+            let name  = names.get(i).map(|s| s.as_str()).unwrap_or("?");
+            let short: String = name.chars().take(7).collect();
             let marker = if i == my_id { "▸" } else { " " };
+            let col_used = if *alive { player_color(i) } else { dim };
+            if !*alive {
+                text_at(&mut out, row, panel_col, dim,
+                    &format!("{}{:<7}  ✗", marker, short));
+                continue;
+            }
             let grens: String = (0..GRENADES_MAX as usize)
                 .map(|k| if k < grenades as usize { '◆' } else { '◇' })
                 .collect();
             let mut fx = String::new();
-            if wide_t > 30.0 {
-                fx.push_str(" ⬛∞");
-            } else if wide_t > 0.0 {
-                fx.push_str(&format!(" ⬛{:.0}s", wide_t.ceil()));
-            }
-            if sniper > 0 {
-                fx.push_str(&format!(" ⊕{}", sniper));
-            }
-            if freeze_t > 0.0 {
-                fx.push_str(&format!(" ❄{:.0}s", freeze_t.ceil()));
-            }
-            if cap & 0x01 != 0 {
-                fx.push_str(" ◎");
-            }
-            let line = format!("{}{:<6} {}{}", marker, short, grens, fx);
-            let col_used = if *alive { player_color(i) } else { dim };
-            text_at(&mut out, row, panel_col, col_used, &line);
+            if wide_t > 30.0     { fx.push_str(" ⬛∞"); }
+            else if wide_t > 0.0 { fx.push_str(&format!(" ⬛{:.0}s", wide_t.ceil())); }
+            if sniper > 0        { fx.push_str(&format!(" ⊕{}", sniper)); }
+            if freeze_t > 0.0    { fx.push_str(&format!(" ❄{:.0}s", freeze_t.ceil())); }
+            if cap & 0x01 != 0   { fx.push_str(" ◎"); }
+            text_at(&mut out, row, panel_col, col_used,
+                &format!("{}{:<7} ♥{:<2} {}{}", marker, short, (*lives).max(0), grens, fx));
         }
     }
 
-    let help = "[←/→] muovi   [SPACE] spara   [G] granata   [R] rivincita   [Q] esci";
-    text_at(&mut out, rows.saturating_sub(1), 1, dim, help);
+    // ── Footer (ultima riga): azzerata + controlli ───────────────────────────
+    let last = rows.saturating_sub(1);
+    ansi_move(&mut out, last, 0);
+    out.push_str(&format!("\x1b[0m{}", blank));
+    let help = "←/→ muovi  SPC spara  G granata  R rivincita  Q esci";
+    text_at(&mut out, last, 1, dim, help);
 
+    // ── TUO STATO: pannello ammo/vite/powerup nel lato destro ───────────────
     if let Some(sc) = snap {
         if my_id < sc.players.len() {
             let (_, lives, alive) = sc.players[my_id];
-            let mine = if alive {
+            let np = sc.players.len();
+            let hud_row = 4 + np;
+            if alive && hud_row + 3 < rows.saturating_sub(1) {
                 let (ammo, _, _, grenades, cap, sniper, wounds, wide_t) =
-                    sc.weapons.get(my_id).copied().unwrap_or((AMMO_MAX, 0.0, 0.0, 0, 0, 0, 0, 0.0));
-                let bar: String = (0..AMMO_MAX as usize)
-                    .map(|i| if i < ammo as usize { '█' } else { '░' })
-                    .collect();
-                let grenade_part = if grenades > 0 {
-                    format!("  ◆x{}", grenades)
+                    sc.weapons.get(my_id).copied()
+                        .unwrap_or((AMMO_MAX, 0.0, 0.0, 0, 0, 0, 0, 0.0));
+                let col = player_color(my_id);
+                text_at(&mut out, hud_row, panel_col, dim, "── TUO STATO ─────────");
+                // Vite: cuori pieni/vuoti
+                let hearts: String = (0..LIVES_START)
+                    .map(|i| if i < lives.max(0) { "♥" } else { "·" })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let extra = if lives > LIVES_START {
+                    format!(" +{}", lives - LIVES_START)
                 } else {
                     String::new()
                 };
-                let sniper_part = if sniper > 0 {
-                    format!("  ⊕x{}", sniper)
-                } else {
-                    String::new()
-                };
-                let wound_part = if wounds > 0 {
-                    format!("  ☠{}/{}", wounds, WOUND_KILLS_AT)
-                } else {
-                    String::new()
-                };
-                let cap_part = if cap & 0x02 != 0 {
-                    "  ◉"
-                } else if cap & 0x01 != 0 {
-                    "  ◎"
-                } else {
-                    ""
-                };
-                let wide_part = if wide_t > 30.0 {
-                    "  ⬛∞".to_string()
-                } else if wide_t > 0.0 {
-                    format!("  ⬛{:.0}s", wide_t.ceil())
-                } else {
-                    String::new()
-                };
-                format!("{} vite  {}{}{}{}{}{}", lives.max(0), bar, grenade_part, sniper_part, wound_part, cap_part, wide_part)
-            } else {
-                "eliminato".to_string()
-            };
-            let col = player_color(my_id);
-            text_at(
-                &mut out,
-                rows.saturating_sub(1),
-                cols.saturating_sub(mine.chars().count() + 1),
-                col,
-                &mine,
-            );
+                text_at(&mut out, hud_row + 1, panel_col, col,
+                    &format!("♥  {}{}", hearts, extra));
+                // Ammo (pallini) + granate
+                let ammo_dots: String = (0..AMMO_MAX as usize)
+                    .map(|k| if k < ammo as usize { "●" } else { "○" })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let reload = if ammo < AMMO_MAX { " ↺" } else { "" };
+                let gren_dots: String = (0..GRENADES_MAX as usize)
+                    .map(|k| if k < grenades as usize { "◆" } else { "◇" })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                text_at(&mut out, hud_row + 2, panel_col, col,
+                    &format!("⊙  {} {}  ◆ {}", ammo_dots, reload, gren_dots));
+                // Powerup attivi
+                let mut pows = String::new();
+                if sniper > 0      { pows.push_str(&format!("⊕×{}  ", sniper)); }
+                if wide_t > 30.0   { pows.push_str("⬛∞  "); }
+                else if wide_t > 0.0 { pows.push_str(&format!("⬛{:.0}s  ", wide_t.ceil())); }
+                if cap & 0x01 != 0 { pows.push_str("◎  "); }
+                if wounds > 0      { pows.push_str(&format!("☠{}/{}", wounds, WOUND_KILLS_AT)); }
+                if !pows.is_empty() {
+                    text_at(&mut out, hud_row + 3, panel_col, col, &pows);
+                }
+            }
         }
     }
     if let Some(st) = status {
-        centered(&mut out, rows.saturating_sub(1), cols, (240, 180, 90), st);
+        centered(&mut out, last, cols, (240, 180, 90), st);
     }
     out
 }
 
-/// Overlay di fine partita.
+/// Overlay di fine partita — mostra vincitore con cornice decorativa.
 pub fn game_over_overlay(cols: usize, rows: usize, winner: usize, my_id: usize, names: &[String]) -> String {
     let mut out = String::new();
     let winner_name = names.get(winner).map(|s| s.as_str()).unwrap_or("???");
-    let (msg, color) = if winner == my_id {
+    let won = winner == my_id;
+
+    let (msg, msg_col): (String, Rgb) = if won {
         ("★  HAI VINTO  ★".to_string(), (120, 240, 160))
     } else {
-        (
-            format!("VINCE {}", winner_name),
-            player_color(winner),
-        )
+        (format!("★  VINCE {}  ★", winner_name), player_color(winner))
     };
+
+    let deco_col: Rgb = if won {
+        (50, 160, 90)
+    } else {
+        let c = player_color(winner);
+        ((c.0 / 2).max(30), (c.1 / 2).max(30), (c.2 / 2).max(30))
+    };
+
+    let deco = "·  ·  ·  ·  ·  ·  ·  ·  ·  ·";
     let mid = rows / 2;
-    centered(&mut out, mid, cols, color, &msg);
-    centered(
-        &mut out,
-        mid + 2,
-        cols,
-        (160, 170, 190),
-        "[R] rivincita    [Q] esci",
-    );
+    centered(&mut out, mid.saturating_sub(1), cols, deco_col, deco);
+    centered(&mut out, mid,                   cols, msg_col,  &msg);
+    centered(&mut out, mid + 1,               cols, deco_col, deco);
+    centered(&mut out, mid + 3,               cols, (150, 158, 178), "R  rivincita    Q  esci");
     out
 }
 
 pub fn too_small(cols: usize, rows: usize) -> String {
     let mut out = String::from("\x1b[2J");
-    centered(
-        &mut out,
-        rows / 2,
-        cols.max(1),
-        (240, 200, 120),
-        "Ingrandisci il terminale (min ~54×20)",
-    );
+    let mid = rows / 2;
+    centered(&mut out, mid.saturating_sub(1), cols.max(1), (90, 224, 205), "▌ PONG · ARENA ▐");
+    centered(&mut out, mid,                   cols.max(1), (240, 200, 120),
+        "Ingrandisci il terminale (min ~54×20)");
+    centered(&mut out, mid + 1,               cols.max(1), (100, 108, 128),
+        &format!("dimensione attuale: {}×{}", cols, rows));
     out
 }
 
@@ -621,34 +663,43 @@ pub fn layout(cols: u16, rows: u16, target: f32) -> Option<(usize, usize, usize,
     Some((cells_w, cells_h, origin_col, origin_row))
 }
 
-/// Overlay lampeggiante mostrato al giocatore che è stato congelato da una granata.
-/// Disegna due barre rosse (sopra/sotto l'area di gioco) e il testo "GRANATA"
-/// centrato; lampeggia a ~2 Hz usando l'orologio di sistema.
-pub fn grenade_overlay(cols: usize, rows: usize, freeze_t: f32) -> String {
+/// Overlay lampeggiante per granata. Pulisce sempre le righe bordo (or_ e rows-2)
+/// per evitare che le barre rosse rimangano dopo la fine dell'effetto.
+/// `oc`/`cw`: colonna e larghezza del frame di gioco, per pulire solo i margini
+/// quando l'effetto non è attivo (il blit copre la parte centrale).
+pub fn grenade_overlay(cols: usize, rows: usize, or_: usize, oc: usize, cw: usize, freeze_t: f32) -> String {
     use std::time::SystemTime;
-    let ms = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_millis();
-    if (ms / 350) % 2 != 0 {
-        return String::new();
-    }
 
-    let red: Rgb = (220, 55, 35);
-    let bright: Rgb = (255, 140, 110);
     let mut out = String::new();
+    let border_rows: [usize; 2] = [or_, rows.saturating_sub(2)];
 
-    // Barra orizzontale piena sopra l'area di gioco (riga 2, sotto i nomi giocatori).
-    let bar: String = "▓".repeat(cols);
-    text_at(&mut out, 2, 0, red, &bar);
-    if rows > 5 {
-        text_at(&mut out, rows - 2, 0, red, &bar);
+    let show = freeze_t > 0.0 && {
+        let ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_millis();
+        (ms / 350) % 2 == 0
+    };
+
+    if show {
+        let red: Rgb = (220, 55, 35);
+        let bright: Rgb = (255, 140, 110);
+        let bar: String = "▓".repeat(cols);
+        for &tr in &border_rows {
+            text_at(&mut out, tr, 0, red, &bar);
+        }
+        let secs = freeze_t.ceil().max(0.0) as u32;
+        centered(&mut out, rows / 2, cols, bright, &format!("⚡ GRANATA  {}s ⚡", secs));
+    } else {
+        // Pulisci solo i margini (la parte centrale è coperta dal blit del frame di gioco)
+        let left  = " ".repeat(oc);
+        let right_start = oc + cw;
+        let right = if cols > right_start { " ".repeat(cols - right_start) } else { String::new() };
+        for &tr in &border_rows {
+            if !left.is_empty()  { text_at(&mut out, tr, 0,           BG, &left);  }
+            if !right.is_empty() { text_at(&mut out, tr, right_start, BG, &right); }
+        }
     }
-
-    // Testo centrato con timer a scendere.
-    let secs = freeze_t.ceil().max(0.0) as u32;
-    let label = format!("⚡ GRANATA  {}s ⚡", secs);
-    centered(&mut out, rows / 2, cols, bright, &label);
 
     out
 }
@@ -746,6 +797,160 @@ pub fn player_name_labels(
         ));
     }
 
+    out
+}
+
+/// Animazione stile "cubo Mario Kart" mostrata al posto di ogni item raccolto.
+/// `anims` = lista di (world_x, world_y, kind_u8, timer) dove timer scende da 0.7 a 0.0.
+pub fn pickup_anim_overlay(
+    anims: &[(f32, f32, u8, f32)],
+    n: usize,
+    my_id: usize,
+    cw: usize,
+    ch: usize,
+    oc: usize,
+    or_: usize,
+) -> String {
+    if anims.is_empty() {
+        return String::new();
+    }
+    let rho: f32 = if n <= 2 {
+        0.0
+    } else {
+        -std::f32::consts::TAU * (my_id as f32 + 0.5) / n as f32
+    };
+    let (hx, hy): (f32, f32) = if n <= 2 { (R as f32, RECT_H as f32) } else { (R as f32, R as f32) };
+    let margin = 1.12_f32;
+    let fw = cw as f32;
+    let fh = (ch * 2) as f32;
+    let scale = (fw / (2.0 * hx * margin)).min(fh / (2.0 * hy * margin));
+    let cx_f = fw / 2.0;
+    let cy_f = fh / 2.0;
+
+    let mut out = String::new();
+    const TOTAL: f32 = 0.7;
+
+    for &(wx, wy, kind, timer) in anims {
+        let q = v2(wx, wy).rot(rho);
+        let px = (cx_f + q.x * scale) as usize;
+        let py = (cy_f - q.y * scale) as usize;
+        let tc = oc + px;
+        let tr = or_ + py / 2;
+
+        let (label, col) = item_kind_display(kind);
+        let phase = (timer / TOTAL).clamp(0.0, 1.0); // 1.0 → 0.0
+
+        if phase > 0.57 {
+            // Fase 1 (0.4 s): cubo giallo con "?"
+            let box_col: Rgb = (255, 218, 50);
+            let tc2 = tc.saturating_sub(2);
+            text_at(&mut out, tr.saturating_sub(1), tc2, box_col, "╔═══╗");
+            text_at(&mut out, tr,                   tc2, box_col, "║ ? ║");
+            text_at(&mut out, tr + 1,               tc2, box_col, "╚═══╝");
+        } else if phase > 0.21 {
+            // Fase 2 (0.25 s): icona del powerup con flash luminoso
+            let t = (phase - 0.21) / 0.36;
+            let flash = blend_color(col, (255, 255, 255), t * 0.6);
+            text_at(&mut out, tr, tc.saturating_sub(1), flash, label);
+        } else {
+            // Fase 3 (0.15 s): dissolvenza verso sfondo
+            let t = phase / 0.21;
+            let fade = blend_color(BG, col, t);
+            text_at(&mut out, tr, tc.saturating_sub(1), fade, label);
+        }
+    }
+    out
+}
+
+/// Padding helpers Unicode-aware (chars().count(), non bytes).
+fn pad_left(s: &str, width: usize) -> String {
+    let len = s.chars().count();
+    if len >= width {
+        s.chars().take(width).collect()
+    } else {
+        format!("{}{}", s, " ".repeat(width - len))
+    }
+}
+
+fn pad_center(s: &str, width: usize) -> String {
+    let len = s.chars().count();
+    if len >= width { return s.chars().take(width).collect(); }
+    let total = width - len;
+    let l = total / 2;
+    format!("{}{}{}", " ".repeat(l), s, " ".repeat(total - l))
+}
+
+/// Overlay di pausa / abbandono partita.
+/// `is_abandon`: true = dialogo abbandono multi; false = menu pausa solo.
+/// `is_host`: aggiunge avviso kick per l'host in modalità abbandono.
+/// `sel`: opzione selezionata (0 = Continua/No, 1 = Esci/Sì).
+pub fn pause_overlay(
+    cols: usize,
+    rows: usize,
+    is_abandon: bool,
+    is_host: bool,
+    sel: usize,
+) -> String {
+    let mut out = String::new();
+    let (title, opt0, opt1) = if is_abandon {
+        (
+            "  Abbandona la partita?  ",
+            "No, continua",
+            if is_host { "Sì — kick tutti" } else { "Sì, abbandona" },
+        )
+    } else {
+        ("    ⏸  IN PAUSA    ", "Continua", "Esci")
+    };
+
+    let inner_w = title.chars().count()
+        .max(opt0.chars().count() + 5)
+        .max(opt1.chars().count() + 5)
+        .max(20);
+    let box_col = cols.saturating_sub(inner_w + 2) / 2;
+    let mid = rows.saturating_sub(6) / 2;
+
+    let border: Rgb = (55, 62, 82);
+    let dim: Rgb    = (100, 108, 128);
+    let bright: Rgb = (255, 255, 255);
+    let accent: Rgb = (90, 224, 205);
+    let sep = "─".repeat(inner_w);
+
+    // Top + title
+    text_at(&mut out, mid, box_col, border, &format!("╔{}╗", sep));
+    text_at(&mut out, mid + 1, box_col, border, "║");
+    text_at(&mut out, mid + 1, box_col + 1, accent, &pad_center(title, inner_w));
+    text_at(&mut out, mid + 1, box_col + 1 + inner_w, border, "║");
+    // Separator
+    text_at(&mut out, mid + 2, box_col, border, &format!("╠{}╣", sep));
+
+    // Option 0
+    let l0 = format!("  {} {}", if sel == 0 { "▸" } else { " " }, opt0);
+    text_at(&mut out, mid + 3, box_col, border, "║");
+    text_at(&mut out, mid + 3, box_col + 1,
+        if sel == 0 { bright } else { dim }, &pad_left(&l0, inner_w));
+    text_at(&mut out, mid + 3, box_col + 1 + inner_w, border, "║");
+
+    // Option 1
+    let l1 = format!("  {} {}", if sel == 1 { "▸" } else { " " }, opt1);
+    text_at(&mut out, mid + 4, box_col, border, "║");
+    text_at(&mut out, mid + 4, box_col + 1,
+        if sel == 1 { bright } else { dim }, &pad_left(&l1, inner_w));
+    text_at(&mut out, mid + 4, box_col + 1 + inner_w, border, "║");
+
+    // Bottom
+    text_at(&mut out, mid + 5, box_col, border, &format!("╚{}╝", sep));
+
+    // Hint
+    centered(&mut out, mid + 7, cols, dim, "↑/↓  muovi   INVIO  conferma   ESC  chiudi");
+    out
+}
+
+/// Banda spettatore mostrata nella riga di stato in basso.
+pub fn spectator_overlay(cols: usize, rows: usize) -> String {
+    let mut out = String::new();
+    let last = rows.saturating_sub(1);
+    let msg = "◎ SPETTATORE — attendi il prossimo round  |  Q  esci";
+    centered(&mut out, last, cols, (90, 224, 205), msg);
     out
 }
 
