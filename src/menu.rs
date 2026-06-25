@@ -5,6 +5,8 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 
+use crate::config::{Config, AVATARS};
+
 // ---------------------------------------------------------------------------
 // Colori
 // ---------------------------------------------------------------------------
@@ -34,8 +36,8 @@ const LOGO: [&str; 6] = [
 // Tipi pubblici
 // ---------------------------------------------------------------------------
 pub enum MenuResult {
-    Host { port: u16, bots: usize, lives: i32, nickname: String },
-    Join { addr: String, port: u16, nickname: String },
+    Host { port: u16, bots: usize, lives: i32, nickname: String, avatar: String },
+    Join { addr: String, port: u16, nickname: String, avatar: String },
     Exit,
 }
 
@@ -67,6 +69,7 @@ struct State {
     screen: Screen,
     sel: usize,
     nickname: String,
+    avatar_idx: usize,
     // host config
     host_port: u16,
     host_bots: usize,
@@ -86,15 +89,33 @@ struct State {
 
 impl State {
     fn new() -> Self {
+        let cfg = Config::load();
+        let avatar_idx = AVATARS
+            .iter()
+            .position(|&a| a == cfg.avatar)
+            .unwrap_or(0);
+
+        // Parse last_server into addr + port
+        let (join_addr, join_port) = if cfg.last_server.is_empty() {
+            (String::new(), 7878u16)
+        } else if let Some(pos) = cfg.last_server.rfind(':') {
+            let addr = cfg.last_server[..pos].to_string();
+            let port = cfg.last_server[pos + 1..].parse().unwrap_or(7878);
+            (addr, port)
+        } else {
+            (cfg.last_server.clone(), 7878)
+        };
+
         State {
             screen: Screen::Main,
             sel: 0,
-            nickname: String::new(),
+            nickname: cfg.nickname,
+            avatar_idx,
             host_port: 7878,
             host_bots: 0,
             host_lives: 7,
-            join_addr: String::new(),
-            join_port: 7878,
+            join_addr,
+            join_port,
             editing: None,
             edit_buf: String::new(),
             blink_on: true,
@@ -105,7 +126,7 @@ impl State {
 
     fn num_items(&self) -> usize {
         match self.screen {
-            Screen::Main => 4,       // Host, Join, Nickname, Esci
+            Screen::Main => 5,       // Host, Join, Nickname, Avatar, Esci
             Screen::HostConfig => 5, // Porta, Bot, Vite, Avvia, Indietro
             Screen::JoinConfig => 4, // Indirizzo, Porta, Connetti, Indietro
         }
@@ -138,8 +159,12 @@ impl State {
             Screen::Main => match idx {
                 0 => "Host (multiplayer)".to_string(),
                 1 => "Join (multiplayer)".to_string(),
-                2 => format!("Nickname:  {}", if self.nickname.is_empty() { "(vuoto)" } else { &self.nickname }),
-                3 => "Esci".to_string(),
+                2 => format!(
+                    "Nickname:  {}",
+                    if self.nickname.is_empty() { "(vuoto)" } else { &self.nickname }
+                ),
+                3 => format!("Avatar:    ◀ {} ▶", AVATARS[self.avatar_idx]),
+                4 => "Esci".to_string(),
                 _ => String::new(),
             },
             Screen::HostConfig => match idx {
@@ -151,7 +176,10 @@ impl State {
                 _ => String::new(),
             },
             Screen::JoinConfig => match idx {
-                0 => format!("Indirizzo: {}", if self.join_addr.is_empty() { "(vuoto)" } else { &self.join_addr }),
+                0 => format!(
+                    "Indirizzo: {}",
+                    if self.join_addr.is_empty() { "(vuoto)" } else { &self.join_addr }
+                ),
                 1 => format!("Porta:     {}", self.join_port),
                 2 => "▶  Connetti!".to_string(),
                 3 => "← Indietro".to_string(),
@@ -162,7 +190,8 @@ impl State {
 
     fn is_action(&self, idx: usize) -> bool {
         match self.screen {
-            Screen::Main => matches!(idx, 0 | 1 | 3),
+            // Avatar (idx 3) is also an action so Enter cycles it instead of opening edit
+            Screen::Main => matches!(idx, 0 | 1 | 3 | 4),
             Screen::HostConfig => matches!(idx, 3 | 4),
             Screen::JoinConfig => matches!(idx, 2 | 3),
         }
@@ -193,7 +222,9 @@ impl State {
         if let Some(idx) = self.editing.take() {
             match self.screen {
                 Screen::Main => {
-                    if idx == 2 { self.nickname = self.edit_buf.clone(); }
+                    if idx == 2 {
+                        self.nickname = self.edit_buf.trim().to_string();
+                    }
                 }
                 Screen::HostConfig => match idx {
                     0 => { self.host_port = self.edit_buf.parse().unwrap_or(self.host_port); }
@@ -208,7 +239,7 @@ impl State {
                     _ => {}
                 },
                 Screen::JoinConfig => match idx {
-                    0 => { self.join_addr = self.edit_buf.clone(); }
+                    0 => { self.join_addr = self.edit_buf.trim().to_string(); }
                     1 => { self.join_port = self.edit_buf.parse().unwrap_or(self.join_port); }
                     _ => {}
                 },
@@ -220,27 +251,48 @@ impl State {
         self.editing = None;
     }
 
+    fn avatar(&self) -> String {
+        AVATARS[self.avatar_idx].to_string()
+    }
+
+    fn save_config(&self, update_server: bool) {
+        let last_server = if update_server {
+            format!("{}:{}", self.join_addr, self.join_port)
+        } else if self.join_addr.is_empty() {
+            String::new()
+        } else {
+            format!("{}:{}", self.join_addr, self.join_port)
+        };
+        Config {
+            nickname: self.nickname.clone(),
+            avatar: self.avatar(),
+            last_server,
+        }
+        .save();
+    }
+
     fn select(&mut self) -> Option<MenuResult> {
         match self.screen {
             Screen::Main => match self.sel {
-                0 => {
-                    // Host → vai al sottomenu host
+                3 => {
+                    // Avatar: Enter cycles forward
+                    self.avatar_idx = (self.avatar_idx + 1) % AVATARS.len();
                     None
                 }
-                1 => {
-                    // Join → vai al sottomenu join
-                    None
-                }
-                3 => Some(MenuResult::Exit),
+                4 => Some(MenuResult::Exit),
                 _ => None,
             },
             Screen::HostConfig => match self.sel {
-                3 => Some(MenuResult::Host {
-                    port: self.host_port,
-                    bots: self.host_bots,
-                    lives: self.host_lives,
-                    nickname: self.nickname.clone(),
-                }),
+                3 => {
+                    self.save_config(false);
+                    Some(MenuResult::Host {
+                        port: self.host_port,
+                        bots: self.host_bots,
+                        lives: self.host_lives,
+                        nickname: self.nickname.clone(),
+                        avatar: self.avatar(),
+                    })
+                }
                 4 => None, // back to main
                 _ => None,
             },
@@ -250,10 +302,12 @@ impl State {
                         self.error = Some(Instant::now());
                         None
                     } else {
+                        self.save_config(true);
                         Some(MenuResult::Join {
                             addr: self.join_addr.clone(),
                             port: self.join_port,
                             nickname: self.nickname.clone(),
+                            avatar: self.avatar(),
                         })
                     }
                 }
@@ -271,7 +325,7 @@ fn render(out: &mut String, s: &State, cols: usize, rows: usize) {
     out.push_str("\x1b[2J");
     out.push_str("\x1b[1J");
 
-    let start = rows.saturating_sub(22) / 2;
+    let start = rows.saturating_sub(24) / 2;
     let mut row = start;
 
     // ── Logo (sempre visibile) ──
@@ -349,7 +403,7 @@ fn render(out: &mut String, s: &State, cols: usize, rows: usize) {
             out.push_str(&mv(row, col));
             out.push_str(&fg(border));
             out.push_str("│");
-            out.push_str(&fg(if s.is_action(i) { BRIGHT } else { BRIGHT }));
+            out.push_str(&fg(BRIGHT));
             out.push_str(&format!("  → {} ", text));
             out.push_str(&fg(border));
             out.push_str("│");
@@ -390,7 +444,7 @@ fn render(out: &mut String, s: &State, cols: usize, rows: usize) {
     let nav = if s.editing.is_some() {
         "INVIO conferma   ESC annulla"
     } else {
-        "↑/↓  muovi   INVIO  seleziona   Q  esci"
+        "↑/↓  muovi   INVIO  seleziona   ←/→  avatar   Q  esci"
     };
     let col = centered_col(cols, nav);
     out.push_str(&mv(row, col));
@@ -456,6 +510,28 @@ pub fn run_menu() -> Option<MenuResult> {
                     KeyCode::Up | KeyCode::Char('k') => s.move_up(),
                     KeyCode::Down | KeyCode::Char('j') => s.move_down(),
 
+                    KeyCode::Left => {
+                        if s.editing.is_none()
+                            && matches!(s.screen, Screen::Main)
+                            && s.sel == 3
+                        {
+                            s.avatar_idx = if s.avatar_idx == 0 {
+                                AVATARS.len() - 1
+                            } else {
+                                s.avatar_idx - 1
+                            };
+                        }
+                    }
+
+                    KeyCode::Right => {
+                        if s.editing.is_none()
+                            && matches!(s.screen, Screen::Main)
+                            && s.sel == 3
+                        {
+                            s.avatar_idx = (s.avatar_idx + 1) % AVATARS.len();
+                        }
+                    }
+
                     KeyCode::Enter => {
                         if s.editing.is_some() {
                             s.confirm_edit();
@@ -463,7 +539,7 @@ pub fn run_menu() -> Option<MenuResult> {
                             s.start_edit();
                         } else {
                             match s.sel {
-                                // Menu principale
+                                // Menu principale → sotto-menu
                                 0 if matches!(s.screen, Screen::Main) => {
                                     s.screen = Screen::HostConfig;
                                     s.sel = 0;

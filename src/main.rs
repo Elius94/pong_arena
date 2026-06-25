@@ -12,6 +12,7 @@
 
 mod app;
 mod arena;
+mod config;
 mod game;
 mod geom;
 mod menu;
@@ -107,15 +108,17 @@ fn main() {
     // Se zero argomenti → menu interattivo TUI.
     if args.is_empty() {
         match menu::run_menu() {
-            Some(menu::MenuResult::Host { port, bots, lives, nickname }) => {
-                let name = if nickname.is_empty() { "Host".to_string() } else { nickname };
+            Some(menu::MenuResult::Host { port, bots, lives, nickname, avatar }) => {
+                let base = if nickname.is_empty() { "Host".to_string() } else { nickname };
+                let name = if avatar.is_empty() { base } else { format!("{} {}", avatar, base) };
                 if let Err(e) = app::run_host(port, bots, name, lives) {
                     eprintln!("Errore host: {e}");
                     std::process::exit(1);
                 }
             }
-            Some(menu::MenuResult::Join { addr, port, nickname }) => {
-                let name = if nickname.is_empty() { "Guest".to_string() } else { nickname };
+            Some(menu::MenuResult::Join { addr, port, nickname, avatar }) => {
+                let base = if nickname.is_empty() { "Guest".to_string() } else { nickname };
+                let name = if avatar.is_empty() { base } else { format!("{} {}", avatar, base) };
                 if let Err(e) = app::run_guest(&addr, port, name) {
                     eprintln!("Errore guest: {e}");
                     std::process::exit(1);

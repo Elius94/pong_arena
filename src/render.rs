@@ -240,19 +240,23 @@ pub fn draw_arena(f: &mut Frame, snap: &Snapshot, my_id: usize, trail: &VecDeque
                     // lato difeso: linea tenue + racchetta colorata con eventuale tinta arma
                     f.line(pa, pb, 0.8, WALL_DIM);
                     let base_col = player_color(pid);
-                    let col = if pid < snap.weapons.len() {
-                        let (_, slow_t, freeze_t, _, _, _, _) = snap.weapons[pid];
-                        if freeze_t > 0.0 {
+                    let (col, paddle_hw) = if pid < snap.weapons.len() {
+                        let (_, slow_t, freeze_t, _, _, _, _, wide_t) = snap.weapons[pid];
+                        let hw = if wide_t > 0.0 { 0.5_f32 } else { PADDLE_FRAC };
+                        let c = if freeze_t > 0.0 {
                             mix(base_col, FREEZE_TINT, 0.75)
+                        } else if wide_t > 0.0 {
+                            mix(base_col, (50, 255, 120), 0.55)
                         } else if slow_t > 0.0 {
                             mix(base_col, SLOW_TINT, 0.3 + 0.55 * slow_t)
                         } else {
                             base_col
-                        }
+                        };
+                        (c, hw)
                     } else {
-                        base_col
+                        (base_col, PADDLE_FRAC)
                     };
-                    let (e0, e1) = arena.paddle_endpoints(pid, c, PADDLE_FRAC);
+                    let (e0, e1) = arena.paddle_endpoints(pid, c, paddle_hw);
                     let (q0, q1) = (view.px(e0), view.px(e1));
                     let thick = if pid == my_id { 2.6 } else { 2.0 };
                     f.line(q0, q1, thick, col);
@@ -351,7 +355,8 @@ fn item_color(kind: u8) -> Rgb {
         1 => (180, 100, 255), // Paralysis: viola
         2 => (50, 220, 220),  // Capture: acqua
         3 => (90, 0, 120),    // BlackHole: viola scuro
-        _ => (255, 60, 60),   // Sniper: rosso acceso
+        4 => (255, 60, 60),   // Sniper: rosso acceso
+        _ => (50, 255, 120),  // WidePaddle: verde brillante
     }
 }
 
@@ -429,14 +434,18 @@ pub fn chrome(
         title_right,
     );
 
-    // Riga giocatori: nomi colorati uno accanto all'altro.
+    // Riga giocatori: nomi colorati + contatore granate.
     if let Some(sc) = snap {
         let mut px = 1;
-        for (i, (_c, _lives, alive)) in sc.players.iter().enumerate() {
+        for (i, ((_c, _lives, alive), wep)) in sc.players.iter().zip(sc.weapons.iter()).enumerate() {
             let name = names.get(i).map(|s| s.as_str()).unwrap_or("???");
             let marker = if i == my_id { "▸" } else { " " };
+            let (_, _, _, grenades, _, _, _, _) = *wep;
+            let grens: String = (0..GRENADES_MAX as usize)
+                .map(|k| if k < grenades as usize { '◆' } else { '◇' })
+                .collect();
             let label = if *alive {
-                format!("{}{}♥{}", marker, name, _lives)
+                format!("{}{}♥{} {}", marker, name, _lives, grens)
             } else {
                 format!("{}{}✗", marker, name)
             };
@@ -449,6 +458,46 @@ pub fn chrome(
         }
     }
 
+    // Pannello legenda powerup — colonna destra, righe 2..2+n.
+    if let Some(sc) = snap {
+        let panel_col = cols.saturating_sub(27);
+        let header = "── powerup ──────────────";
+        text_at(&mut out, 2, panel_col, dim, header);
+        for (i, ((_c_f, _lives, alive), wep)) in
+            sc.players.iter().zip(sc.weapons.iter()).enumerate()
+        {
+            let row = 3 + i;
+            if row + 1 >= rows.saturating_sub(1) {
+                break;
+            }
+            let (_, _, freeze_t, grenades, cap, sniper, _wounds, wide_t) = *wep;
+            let name = names.get(i).map(|s| s.as_str()).unwrap_or("?");
+            let short: String = name.chars().take(6).collect();
+            let marker = if i == my_id { "▸" } else { " " };
+            let grens: String = (0..GRENADES_MAX as usize)
+                .map(|k| if k < grenades as usize { '◆' } else { '◇' })
+                .collect();
+            let mut fx = String::new();
+            if wide_t > 30.0 {
+                fx.push_str(" ⬛∞");
+            } else if wide_t > 0.0 {
+                fx.push_str(&format!(" ⬛{:.0}s", wide_t.ceil()));
+            }
+            if sniper > 0 {
+                fx.push_str(&format!(" ⊕{}", sniper));
+            }
+            if freeze_t > 0.0 {
+                fx.push_str(&format!(" ❄{:.0}s", freeze_t.ceil()));
+            }
+            if cap & 0x01 != 0 {
+                fx.push_str(" ◎");
+            }
+            let line = format!("{}{:<6} {}{}", marker, short, grens, fx);
+            let col_used = if *alive { player_color(i) } else { dim };
+            text_at(&mut out, row, panel_col, col_used, &line);
+        }
+    }
+
     let help = "[←/→] muovi   [SPACE] spara   [G] granata   [R] rivincita   [Q] esci";
     text_at(&mut out, rows.saturating_sub(1), 1, dim, help);
 
@@ -456,8 +505,8 @@ pub fn chrome(
         if my_id < sc.players.len() {
             let (_, lives, alive) = sc.players[my_id];
             let mine = if alive {
-                let (ammo, _, _, grenades, cap, sniper, wounds) =
-                    sc.weapons.get(my_id).copied().unwrap_or((AMMO_MAX, 0.0, 0.0, 0, 0, 0, 0));
+                let (ammo, _, _, grenades, cap, sniper, wounds, wide_t) =
+                    sc.weapons.get(my_id).copied().unwrap_or((AMMO_MAX, 0.0, 0.0, 0, 0, 0, 0, 0.0));
                 let bar: String = (0..AMMO_MAX as usize)
                     .map(|i| if i < ammo as usize { '█' } else { '░' })
                     .collect();
@@ -483,7 +532,14 @@ pub fn chrome(
                 } else {
                     ""
                 };
-                format!("{} vite  {}{}{}{}{}", lives.max(0), bar, grenade_part, sniper_part, wound_part, cap_part)
+                let wide_part = if wide_t > 30.0 {
+                    "  ⬛∞".to_string()
+                } else if wide_t > 0.0 {
+                    format!("  ⬛{:.0}s", wide_t.ceil())
+                } else {
+                    String::new()
+                };
+                format!("{} vite  {}{}{}{}{}{}", lives.max(0), bar, grenade_part, sniper_part, wound_part, cap_part, wide_part)
             } else {
                 "eliminato".to_string()
             };
@@ -593,6 +649,102 @@ pub fn grenade_overlay(cols: usize, rows: usize, freeze_t: f32) -> String {
     let secs = freeze_t.ceil().max(0.0) as u32;
     let label = format!("⚡ GRANATA  {}s ⚡", secs);
     centered(&mut out, rows / 2, cols, bright, &label);
+
+    out
+}
+
+/// Overlay ANSI con il nome di ciascun giocatore affiancato al proprio contatore vite.
+/// Riga identica al bitmap del numero vite; colonna spostata a fianco del numero
+/// (verso il centro del campo) così non si sovrappone alle barriere.
+pub fn player_name_labels(
+    snap: &Snapshot,
+    names: &[String],
+    cw: usize,
+    ch: usize,
+    oc: usize,
+    or_: usize,
+    my_id: usize,
+    cols: usize,
+    rows: usize,
+) -> String {
+    let n = snap.n;
+    if n == 0 || names.is_empty() {
+        return String::new();
+    }
+    let arena = Arena::new(n);
+
+    let rho: f32 = if n <= 2 {
+        0.0
+    } else {
+        -std::f32::consts::TAU * (my_id as f32 + 0.5) / n as f32
+    };
+    let (hx, hy): (f32, f32) = if n <= 2 {
+        (R as f32, RECT_H as f32)
+    } else {
+        (R as f32, R as f32)
+    };
+    let margin = 1.12_f32;
+    let fw = cw as f32;
+    let fh = (ch * 2) as f32;
+    let scale = (fw / (2.0 * hx * margin)).min(fh / (2.0 * hy * margin));
+    let cx_f = fw / 2.0;
+    let cy_f = fh / 2.0;
+    // Stessa formula di draw_arena per il font scale del numero
+    let s = (((ch * 2) as i32) / 60).max(1);
+
+    let mut out = String::new();
+
+    for w in &arena.walls {
+        let pid = match w.owner {
+            Some(p) => p,
+            None => continue,
+        };
+        if pid >= snap.players.len() {
+            continue;
+        }
+        let (_c, _lives, alive) = snap.players[pid];
+        if !alive {
+            continue;
+        }
+
+        let mid = w.point(0.5);
+        let outside = mid + w.n * -7.0;
+        let q = outside.rot(rho);
+        let px = cx_f + q.x * scale;
+        let py = cy_f - q.y * scale;
+
+        // Stessa riga del bitmap vite (ly - 2*s in pixel → riga terminale)
+        let tr = or_ as i32 + (py as i32 - 2 * s) / 2;
+
+        if tr < 2 || tr >= rows as i32 - 1 {
+            continue;
+        }
+
+        let name = names.get(pid).map(|s| s.as_str()).unwrap_or("?");
+        let label: String = name.chars().take(12).collect();
+        let label_len = label.chars().count() as i32;
+
+        // Posiziona a fianco del numero: a destra se il muro è nella metà sinistra,
+        // a sinistra se è nella metà destra (nome verso il centro del campo).
+        let base_tc = oc as i32 + px as i32;
+        let tc = if px < fw / 2.0 {
+            base_tc + 3 // muro sinistro: nome a destra del numero
+        } else {
+            base_tc - label_len - 2 // muro destro: nome a sinistra del numero
+        };
+        let tc = tc.max(0).min((cols as i32 - label_len).max(0));
+
+        let col = if pid == my_id { LOCAL_HI } else { player_color(pid) };
+        out.push_str(&format!(
+            "\x1b[{};{}H\x1b[38;2;{};{};{}m{}\x1b[0m",
+            tr + 1,
+            tc + 1,
+            col.0,
+            col.1,
+            col.2,
+            label
+        ));
+    }
 
     out
 }

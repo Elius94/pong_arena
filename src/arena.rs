@@ -21,7 +21,7 @@ pub const PADDLE_FRAC: f32 = 0.14;
 
 /// Velocità della racchetta in parametro-di-lato al secondo (l'intero lato va
 /// da 0 a 1, quindi questo è "lati al secondo").
-pub const PADDLE_PARAM_SPEED: f32 = 1.15;
+pub const PADDLE_PARAM_SPEED: f32 = 1.6;
 
 /// Un muro dell'arena: segmento `a`→`b` con normale interna `n`.
 #[derive(Clone, Copy, Debug)]

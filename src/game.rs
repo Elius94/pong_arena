@@ -25,20 +25,24 @@ pub const SPEED_RAMP_RATE: f32 = 0.3;  // incremento minSpeed per secondo
 pub const SPEED_RAMP_MAX: f32 = 50.0;  // cap sopra BASE_SPEED
 
 // ---- Armi -----------------------------------------------------------------
-pub const AMMO_MAX: i32 = 10;
-pub const AMMO_RELOAD_RATE: f32 = 0.2;
+pub const AMMO_MAX: i32 = 3;
+pub const AMMO_RELOAD_RATE: f32 = 0.1; // 30 s per ricaricare 3 colpi
 pub const BULLET_SPEED: f32 = 240.0;
 pub const BULLET_R: f32 = 1.2;
 pub const SLOW_PER_HIT: f32 = 0.4;
-pub const SLOW_DECAY_RATE: f32 = 0.12;
+pub const SLOW_DECAY_RATE: f32 = 0.40;
 pub const SLOW_MIN_SPEED: f32 = 0.25;
 pub const BULLET_DEFLECTION: f32 = 0.7;
-pub const FREEZE_DURATION: f32 = 2.0;
+pub const FREEZE_DURATION: f32 = 1.3;
 pub const GRENADES_MAX: i32 = 2;
 pub const BOT_JITTER: f32 = 0.10;
 pub const SNIPER_AMMO: i32 = 5;    // proiettili letali per item raccolto
 pub const WOUND_KILLS_AT: i32 = 3; // colpi letali per eliminare
 pub const LETHAL_SPEED: f32 = 340.0;
+
+// ---- Wide paddle powerup -------------------------------------------------
+pub const WIDE_PADDLE_DURATION: f32 = 10.0;
+pub const WIDE_PADDLE_HW: f32 = 0.5; // mezza-ampiezza = intero lato
 
 // ---- Item box -------------------------------------------------------------
 pub const ITEM_R: f32 = 5.0;
@@ -48,7 +52,7 @@ pub const PARALYSIS_DURATION: f32 = 3.0;
 
 // ---- Buco nero ------------------------------------------------------------
 pub const BLACK_HOLE_DURATION: f32 = 7.0;
-pub const BLACK_HOLE_G: f32 = 1700.0;  // forza gravitazionale (unità/s²)
+pub const BLACK_HOLE_G: f32 = 5000.0;  // forza gravitazionale (unità/s²)
 pub const BLACK_HOLE_VIS_R: f32 = 10.0; // raggio visuale per il rendering
 
 // ---- Regole ---------------------------------------------------------------
@@ -85,6 +89,7 @@ pub struct WeaponState {
     pub capture_ready: bool,
     pub sniper_ammo: i32,  // proiettili letali disponibili (da item Sniper)
     pub wound_count: i32,  // colpi letali subìti (a WOUND_KILLS_AT → eliminazione)
+    pub wide_paddle_timer: f32, // secondi rimanenti di paletta larga
 }
 
 impl WeaponState {
@@ -100,6 +105,7 @@ impl WeaponState {
             capture_ready: false,
             sniper_ammo: 0,
             wound_count: 0,
+            wide_paddle_timer: 0.0,
         }
     }
 }
@@ -127,6 +133,7 @@ pub enum ItemKind {
     Capture    = 2,
     BlackHole  = 3,
     Sniper     = 4, // proiettili letali: 3 colpi = eliminazione istantanea
+    WidePaddle = 5, // paletta larga come tutto il lato per 10 secondi
 }
 
 pub struct Item {
@@ -170,6 +177,7 @@ pub struct GameState {
     last_hitter: Option<usize>,
     rng: u64,
     pub start_lives: i32,
+    multiball_guard: Option<usize>, // pid che ha attivato multiball; riceve paletta larga finché ci sono palle extra
 }
 
 impl GameState {
@@ -205,6 +213,7 @@ impl GameState {
             last_hitter: None,
             rng: seed | 1,
             start_lives: lives,
+            multiball_guard: None,
         };
         g.serve();
         g
@@ -295,6 +304,7 @@ impl GameState {
             *k = 0;
         }
         self.last_hitter = None;
+        self.multiball_guard = None;
         self.serve();
         if let Some(w) = self.sole_survivor() {
             self.phase = Phase::GameOver(w);
@@ -486,7 +496,9 @@ impl GameState {
         self.arena.walls[wi].owner = None;
     }
 
-    fn concede(&mut self, pid: usize) {
+    // Assegna un punto contro pid (riduce vita, elimina se necessario, controlla game over).
+    // Non serve una nuova palla — farlo spetta al chiamante.
+    fn award_point(&mut self, pid: usize) {
         self.stuck_timer = 0.0;
         if let Some(scorer) = self.last_hitter {
             if scorer != pid && self.players[scorer].alive {
@@ -507,13 +519,18 @@ impl GameState {
         }
         if self.players[pid].lives <= 0 && self.players[pid].alive {
             self.eliminate(pid);
-        }
-        if let Some(w) = self.sole_survivor() {
-            self.phase = Phase::GameOver(w);
-            for ball in &mut self.balls {
-                ball.vel = v2(0.0, 0.0);
+            if let Some(w) = self.sole_survivor() {
+                self.phase = Phase::GameOver(w);
+                for ball in &mut self.balls {
+                    ball.vel = v2(0.0, 0.0);
+                }
             }
-        } else {
+        }
+    }
+
+    fn concede(&mut self, pid: usize) {
+        self.award_point(pid);
+        if !matches!(self.phase, Phase::GameOver(_)) {
             self.serve();
         }
     }
@@ -557,9 +574,10 @@ impl GameState {
 
     fn advance_balls(&mut self, dt: f32) {
         let count = self.balls.len();
-        let mut scored: Option<usize> = None;
+        // (indice palla, pid a cui viene assegnato il punto)
+        let mut scored: Vec<(usize, usize)> = Vec::new();
 
-        'outer: for bi in 0..count {
+        for bi in 0..count {
             // Palla trattenuta: segue la racchetta del giocatore.
             if let Some(holder) = self.balls[bi].captured_by {
                 if self.players[holder].alive {
@@ -621,7 +639,12 @@ impl GameState {
                         }
                         Some(pid) => {
                             let pc = self.players[pid].c;
-                            if (t - pc).abs() <= PADDLE_FRAC {
+                            let hw = if self.weapons[pid].wide_paddle_timer > 0.0 {
+                                WIDE_PADDLE_HW
+                            } else {
+                                PADDLE_FRAC
+                            };
+                            if (t - pc).abs() <= hw {
                                 // Capture item attivo: trattieni la palla.
                                 if self.weapons[pid].capture_ready {
                                     self.weapons[pid].capture_ready = false;
@@ -632,7 +655,7 @@ impl GameState {
                                     break;
                                 }
                                 // Riflessione normale con speedup e ramp.
-                                let off = ((t - pc) / PADDLE_FRAC).clamp(-1.0, 1.0);
+                                let off = ((t - pc) / hw).clamp(-1.0, 1.0);
                                 let dir = w.n.rot(off * MAX_BOUNCE);
                                 let min_speed = self.current_min_speed();
                                 let new_speed = (self.balls[bi].vel.len() * SPEEDUP)
@@ -644,20 +667,46 @@ impl GameState {
                                 self.last_hitter = Some(pid);
                                 self.stuck_timer = 0.0;
                             } else {
-                                scored = Some(pid);
+                                scored.push((bi, pid));
                                 break 'steps;
                             }
                         }
                     }
                 }
             }
-            if scored.is_some() {
-                break 'outer;
+        }
+
+        // Ogni palla può segnare al più una volta per frame.
+        scored.sort_unstable_by_key(|&(bi, _)| bi);
+        scored.dedup_by_key(|&mut (bi, _)| bi);
+
+        // Assegna i punti (senza ancora togliere le palle).
+        for &(_, pid) in &scored {
+            if !matches!(self.phase, Phase::GameOver(_)) {
+                self.award_point(pid);
             }
         }
 
-        if let Some(pid) = scored {
-            self.concede(pid);
+        // Rimuovi le palle che hanno segnato (indici in ordine inverso per stabilità).
+        for &(bi, _) in scored.iter().rev() {
+            if bi < self.balls.len() {
+                self.balls.remove(bi);
+            }
+        }
+
+        // Se le palle extra del multiball sono finite, rimuovi la protezione.
+        if let Some(guard_pid) = self.multiball_guard {
+            if self.balls.len() <= 1 {
+                if guard_pid < self.weapons.len() {
+                    self.weapons[guard_pid].wide_paddle_timer = 0.0;
+                }
+                self.multiball_guard = None;
+            }
+        }
+
+        // Quando tutte le palle sono uscite e la partita è ancora in corso, servi.
+        if self.balls.is_empty() && !matches!(self.phase, Phase::GameOver(_)) {
+            self.serve();
         }
     }
 
@@ -671,6 +720,9 @@ impl GameState {
                 if w.freeze_timer == 0.0 {
                     w.grenade_frozen = false;
                 }
+            }
+            if w.wide_paddle_timer > 0.0 {
+                w.wide_paddle_timer = (w.wide_paddle_timer - dt).max(0.0);
             }
             if w.ammo < AMMO_MAX {
                 w.reload_acc += dt * AMMO_RELOAD_RATE;
@@ -781,6 +833,11 @@ impl GameState {
                             captured_by: None,
                         });
                     }
+                    // L'attivatore riceve paletta larga per tutta la durata delle palle extra.
+                    if let Some(pid) = activator {
+                        self.weapons[pid].wide_paddle_timer = 99.0; // sentinella: gestita da multiball_guard
+                        self.multiball_guard = Some(pid);
+                    }
                 }
                 ItemKind::Paralysis => {
                     if let Some(pid) = activator {
@@ -808,6 +865,12 @@ impl GameState {
                             (self.weapons[pid].sniper_ammo + SNIPER_AMMO).min(SNIPER_AMMO * 2);
                     }
                 }
+                ItemKind::WidePaddle => {
+                    if let Some(pid) = activator {
+                        self.weapons[pid].wide_paddle_timer = WIDE_PADDLE_DURATION
+                            .max(self.weapons[pid].wide_paddle_timer);
+                    }
+                }
             }
         }
 
@@ -821,13 +884,14 @@ impl GameState {
                 let angle = rand_unit(&mut self.rng) * std::f32::consts::TAU;
                 let dist = rand_unit(&mut self.rng).sqrt() * R * 0.4;
                 let pos = v2(angle.cos() * dist, angle.sin() * dist);
-                let k = xorshift(&mut self.rng) % 5;
+                let k = xorshift(&mut self.rng) % 6;
                 let kind = match k {
                     0 => ItemKind::Multiball,
                     1 => ItemKind::Paralysis,
                     2 => ItemKind::Capture,
                     3 => ItemKind::BlackHole,
-                    _ => ItemKind::Sniper,
+                    4 => ItemKind::Sniper,
+                    _ => ItemKind::WidePaddle,
                 };
                 self.items.push(Item { pos, kind });
                 self.item_spawn_timer = ITEM_INTERVAL;
@@ -844,7 +908,7 @@ impl GameState {
             Phase::GameOver(w) => (2, 0.0, w as i32),
         };
         let balls: Vec<V2> = self.balls.iter().map(|b| b.pos).collect();
-        let weapons: Vec<(i32, f32, f32, i32, u8, i32, i32)> = self
+        let weapons: Vec<(i32, f32, f32, i32, u8, i32, i32, f32)> = self
             .weapons
             .iter()
             .enumerate()
@@ -854,7 +918,7 @@ impl GameState {
                 let cap = (w.capture_ready as u8)
                     | ((holding as u8) << 1)
                     | ((w.grenade_frozen as u8) << 2);
-                (w.ammo, w.slow_level, w.freeze_timer, w.grenades, cap, w.sniper_ammo, w.wound_count)
+                (w.ammo, w.slow_level, w.freeze_timer, w.grenades, cap, w.sniper_ammo, w.wound_count, w.wide_paddle_timer)
             })
             .collect();
         let items: Vec<(V2, u8)> = self.items.iter().map(|it| (it.pos, it.kind as u8)).collect();
@@ -884,7 +948,7 @@ pub struct Snapshot {
     pub n: usize,
     pub balls: Vec<V2>,
     pub players: Vec<(f32, i32, bool)>,
-    pub weapons: Vec<(i32, f32, f32, i32, u8, i32, i32)>, // (ammo,slow,freeze,grenades,cap,sniper_ammo,wound_count)
+    pub weapons: Vec<(i32, f32, f32, i32, u8, i32, i32, f32)>, // (ammo,slow,freeze,grenades,cap,sniper_ammo,wound_count,wide_paddle_timer)
     pub bullets: Vec<(V2, usize, bool)>, // (pos, shooter, lethal)
     pub items: Vec<(V2, u8)>,
     pub black_hole_timer: f32,
@@ -902,10 +966,10 @@ impl Snapshot {
         for (c, lives, alive) in &self.players {
             s.push_str(&format!(" {:.4} {} {}", c, lives, if *alive { 1 } else { 0 }));
         }
-        for (ammo, slow, freeze, grenades, cap, sniper, wounds) in &self.weapons {
+        for (ammo, slow, freeze, grenades, cap, sniper, wounds, wide) in &self.weapons {
             s.push_str(&format!(
-                " {} {:.2} {:.2} {} {} {} {}",
-                ammo, slow, freeze, grenades, cap, sniper, wounds
+                " {} {:.2} {:.2} {} {} {} {} {:.2}",
+                ammo, slow, freeze, grenades, cap, sniper, wounds, wide
             ));
         }
         s.push_str(&format!(" {}", self.bullets.len()));
@@ -953,7 +1017,8 @@ impl Snapshot {
             let cap: u8 = it.next()?.parse().ok()?;
             let sniper: i32 = it.next()?.parse().ok()?;
             let wounds: i32 = it.next()?.parse().ok()?;
-            weapons.push((ammo, slow, freeze, grenades, cap, sniper, wounds));
+            let wide: f32 = it.next()?.parse().ok()?;
+            weapons.push((ammo, slow, freeze, grenades, cap, sniper, wounds, wide));
         }
         let nb_bullets: usize = it.next()?.parse().ok()?;
         let mut bullets = Vec::with_capacity(nb_bullets);

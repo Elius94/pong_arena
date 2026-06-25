@@ -80,6 +80,9 @@ fn compose(snap: &Snapshot, my_id: usize, title_right: &str, names: &[String]) -
         status_owned.as_deref(),
         names,
     ));
+    out.push_str(&render::player_name_labels(
+        snap, names, cw, ch, oc, or_, my_id, cols as usize, rows_n,
+    ));
     if snap.phase_code == 2 {
         out.push_str(&render::game_over_overlay(
             cols as usize,
@@ -90,7 +93,7 @@ fn compose(snap: &Snapshot, my_id: usize, title_right: &str, names: &[String]) -
         ));
     }
     // Overlay granata: mostrato solo al giocatore congelato da una granata avversaria.
-    if let Some(&(_, _, freeze_t, _, cap, _, _)) = snap.weapons.get(my_id) {
+    if let Some(&(_, _, freeze_t, _, cap, _, _, _)) = snap.weapons.get(my_id) {
         if freeze_t > 0.0 && cap & 0x04 != 0 {
             out.push_str(&render::grenade_overlay(cols as usize, rows_n, freeze_t));
         }
