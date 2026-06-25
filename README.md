@@ -1,5 +1,7 @@
 # Pong Arena
 
+<img width="1145" height="853" alt="Animazione" src="https://github.com/user-attachments/assets/b624863d-e5f6-4ef3-94ff-1f1bf104b1f1" />
+
 Pong **LAN adattivo** scritto in Rust, da terminale. Il campo **cambia forma in base a quanti si collegano**:
 
 - **2 giocatori → Pong classico**: campo rettangolare, racchette a sinistra e a destra, lati corti come muri.
@@ -21,6 +23,8 @@ cargo build --release
 L'eseguibile è `target/release/pong_arena`.
 
 ---
+
+<img width="1917" height="1150" alt="image" src="https://github.com/user-attachments/assets/08c18a69-cd1e-449a-b3df-ec14627db615" />
 
 ## Giocare in LAN
 
