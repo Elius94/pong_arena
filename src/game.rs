@@ -528,6 +528,7 @@ impl GameState {
         }
     }
 
+    #[cfg(test)]
     fn concede(&mut self, pid: usize) {
         self.award_point(pid);
         if !matches!(self.phase, Phase::GameOver(_)) {
