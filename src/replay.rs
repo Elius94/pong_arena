@@ -48,6 +48,7 @@ pub fn format_ts(ts: u64) -> String {
 // ---------------------------------------------------------------------------
 
 /// Metadati di un replay (letti scansionando l'header senza caricare tutti i frame).
+#[allow(dead_code)]
 pub struct ReplayInfo {
     pub path: PathBuf,
     pub timestamp: u64,
