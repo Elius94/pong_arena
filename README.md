@@ -2,6 +2,8 @@
 
 <img width="1145" height="853" alt="Animazione" src="https://github.com/user-attachments/assets/b624863d-e5f6-4ef3-94ff-1f1bf104b1f1" />
 
+<img width="1918" height="1147" alt="Animazione3" src="https://github.com/user-attachments/assets/b9fd12c8-b0a7-4abe-baa1-cd9fbbb5eb0a" />
+
 Pong **LAN adattivo** scritto in Rust, da terminale. Il campo **cambia forma in base a quanti si collegano**:
 
 - **2 giocatori → Pong classico**: campo rettangolare, racchette a sinistra e a destra, lati corti come muri.
